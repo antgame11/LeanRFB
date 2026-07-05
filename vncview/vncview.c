@@ -120,17 +120,18 @@ static AVBufferRef* hw_device_ctx = NULL;
 static AVFrame* sw_frame = NULL;
 static enum AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
 static enum AVPixelFormat last_format = AV_PIX_FMT_NONE;
+static enum AVPixelFormat expected_hw_pix_fmt = AV_PIX_FMT_NONE;
 
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
     (void)ctx;
     const enum AVPixelFormat *p;
     for (p = pix_fmts; *p != -1; p++) {
-        if (*p == AV_PIX_FMT_VAAPI || *p == AV_PIX_FMT_CUDA) {
+        if (*p == expected_hw_pix_fmt) {
             hw_pix_fmt = *p;
             return *p;
         }
     }
-    fprintf(stderr, "Failed to get HW surface format.\n");
+    fprintf(stderr, "Failed to get expected HW surface format.\n");
     return AV_PIX_FMT_NONE;
 }
 
@@ -155,6 +156,7 @@ static void init_decoder(int width, int height) {
     if (ret >= 0) {
         codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
         codec_ctx->get_format = get_hw_format;
+        expected_hw_pix_fmt = AV_PIX_FMT_VAAPI;
         printf("[VNCVIEW] GPU VA-API Hardware Decoding enabled successfully.\n");
     } else {
         // Try GPU CUDA (Nvidia)
@@ -162,8 +164,10 @@ static void init_decoder(int width, int height) {
         if (ret >= 0) {
             codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
             codec_ctx->get_format = get_hw_format;
+            expected_hw_pix_fmt = AV_PIX_FMT_CUDA;
             printf("[VNCVIEW] GPU CUDA Hardware Decoding enabled successfully.\n");
         } else {
+            expected_hw_pix_fmt = AV_PIX_FMT_NONE;
             printf("[VNCVIEW] GPU Hardware Decoding not supported. Falling back to CPU software decoding.\n");
         }
     }
@@ -209,6 +213,7 @@ static void reset_decoder(int width, int height) {
     }
     hw_pix_fmt = AV_PIX_FMT_NONE;
     last_format = AV_PIX_FMT_NONE;
+    expected_hw_pix_fmt = AV_PIX_FMT_NONE;
     init_decoder(width, height);
 }
 
@@ -668,6 +673,7 @@ static void on_viewer_destroy(void) {
     }
     hw_pix_fmt = AV_PIX_FMT_NONE;
     last_format = AV_PIX_FMT_NONE;
+    expected_hw_pix_fmt = AV_PIX_FMT_NONE;
     viewer_window = NULL;
     gtk_widget_show_all(main_window);
 }
