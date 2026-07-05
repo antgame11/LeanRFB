@@ -117,7 +117,68 @@ static unsigned long long get_time_ms(void) {
 
 int main(int argc, char* argv[]) {
     int port = 5900;
+    char config_password[256] = {0};
+    char config_listen_host[64] = {0};
+    char config_name[128] = {0};
+    int max_clients = 16;
+    int websocket_enabled = 0;
     const char* password = NULL;
+    const char* listen_host = "0.0.0.0";
+    const char* display_name = "leanrfb X11 Server";
+
+    // Try parsing config file first
+    FILE* cf = fopen("x11_vnc_server.conf", "r");
+    if (!cf) {
+        cf = fopen("x11_vnc/x11_vnc_server.conf", "r");
+    }
+    if (cf) {
+        char line[256];
+        while (fgets(line, sizeof(line), cf)) {
+            // Strip comments
+            char* comment = strchr(line, '#');
+            if (comment) *comment = '\0';
+            
+            // Trim whitespace
+            char* key = line;
+            while (*key == ' ' || *key == '\t') key++;
+            char* end = key + strlen(key) - 1;
+            while (end > key && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
+                *end = '\0';
+                end--;
+            }
+            if (*key == '\0') continue;
+
+            char* value = strchr(key, '=');
+            if (!value) continue;
+            *value = '\0';
+            value++;
+            while (*value == ' ' || *value == '\t') value++;
+
+            if (strcmp(key, "port") == 0) {
+                port = atoi(value);
+            } else if (strcmp(key, "listen_host") == 0) {
+                strncpy(config_listen_host, value, sizeof(config_listen_host) - 1);
+                listen_host = config_listen_host;
+            } else if (strcmp(key, "display_name") == 0) {
+                strncpy(config_name, value, sizeof(config_name) - 1);
+                display_name = config_name;
+            } else if (strcmp(key, "password") == 0) {
+                strncpy(config_password, value, sizeof(config_password) - 1);
+                password = config_password;
+            } else if (strcmp(key, "max_clients") == 0) {
+                max_clients = atoi(value);
+            } else if (strcmp(key, "websocket") == 0) {
+                if (strcmp(value, "y") == 0 || strcmp(value, "yes") == 0 || strcmp(value, "1") == 0 || strcmp(value, "true") == 0) {
+                    websocket_enabled = 1;
+                } else {
+                    websocket_enabled = 0;
+                }
+            }
+        }
+        fclose(cf);
+    }
+
+    // Command-line arguments override configuration file
     if (argc > 1) {
         port = atoi(argv[1]);
         if (port < 1 || port > 65535) {
@@ -126,9 +187,9 @@ int main(int argc, char* argv[]) {
         }
     }
     if (argc > 2) {
-        password = argv[2];
+        strncpy(config_password, argv[2], sizeof(config_password) - 1);
+        password = config_password;
         // Zero out the argv entry so the password is not visible in /proc/<pid>/cmdline
-        // (the password has already been captured in the pointer above)
         volatile char* p = argv[2];
         while (*p) { *p++ = '\0'; }
     }
@@ -161,11 +222,13 @@ int main(int argc, char* argv[]) {
     vnc_server_config_t config;
     memset(&config, 0, sizeof(config));
     config.port = port;
-    config.listen_host = "0.0.0.0";
-    config.name = "leanrfb X11 Server";
+    config.listen_host = listen_host;
+    config.name = display_name;
     config.width = (uint16_t)width;
     config.height = (uint16_t)height;
     config.password = password;
+    config.max_clients = max_clients;
+    config.websocket = websocket_enabled;
     config.on_key = on_key;
     config.on_pointer = on_pointer;
     config.user_data = &ctx;

@@ -25,6 +25,7 @@ typedef struct vnc_server_config {
     uint16_t height;           // Framebuffer height
     const char* password;      // Authentication password (NULL/empty for no authentication)
     int max_clients;           // Maximum simultaneous clients (0 = use default of 16)
+    int websocket;             // 1 to enable WebSocket/HTTP mode on the same port
 
     vnc_key_event_cb on_key;   // Key event callback
     vnc_pointer_event_cb on_pointer; // Pointer event callback

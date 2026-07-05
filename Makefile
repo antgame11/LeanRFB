@@ -20,13 +20,13 @@ demo_server: examples/demo_server.o $(LIB_NAME)
 examples/demo_server.o: examples/demo_server.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-x11_vnc_server: examples/x11_vnc_server.o $(LIB_NAME)
-	$(CC) -o $@ examples/x11_vnc_server.o $(LDFLAGS) $(X11_LDFLAGS)
+x11_vnc_server: x11_vnc/x11_vnc_server.o $(LIB_NAME)
+	$(CC) -o $@ x11_vnc/x11_vnc_server.o $(LDFLAGS) $(X11_LDFLAGS)
 
-examples/x11_vnc_server.o: examples/x11_vnc_server.c
+x11_vnc/x11_vnc_server.o: x11_vnc/x11_vnc_server.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f src/*.o examples/*.o $(LIB_NAME) demo_server x11_vnc_server
+	rm -f src/*.o examples/*.o x11_vnc/*.o $(LIB_NAME) demo_server x11_vnc_server
 
 .PHONY: all clean

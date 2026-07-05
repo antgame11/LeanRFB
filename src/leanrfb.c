@@ -1,9 +1,11 @@
 #define _DEFAULT_SOURCE
 #include "leanrfb_internal.h"
+#include "vnc_lite_standalone.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/des.h>
+#include <openssl/evp.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -22,6 +24,159 @@ static int client_write_raw(vnc_client_t* client, const void* data, size_t len);
 static void vnc_client_disconnect(vnc_server_t* server, vnc_client_t* client);
 static void client_read_handler(vnc_server_t* server, vnc_client_t* client);
 static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client);
+
+// --- WebSocket and HTTP helpers ---
+
+static const char* case_insensitive_strstr(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return NULL;
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) return haystack;
+    
+    for (; *haystack; haystack++) {
+        size_t i;
+        for (i = 0; i < needle_len; i++) {
+            char h = haystack[i];
+            char n = needle[i];
+            if (h >= 'A' && h <= 'Z') h = h - 'A' + 'a';
+            if (n >= 'A' && n <= 'Z') n = n - 'A' + 'a';
+            if (h != n) break;
+        }
+        if (i == needle_len) {
+            return haystack;
+        }
+    }
+    return NULL;
+}
+
+static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void base64_encode(const unsigned char* src, size_t len, char* out) {
+    size_t i;
+    for (i = 0; i < len; i += 3) {
+        uint32_t val = (src[i] << 16) | ((i + 1 < len ? src[i+1] : 0) << 8) | (i + 2 < len ? src[i+2] : 0);
+        *out++ = b64chars[(val >> 18) & 0x3F];
+        *out++ = b64chars[(val >> 12) & 0x3F];
+        *out++ = (i + 1 < len) ? b64chars[(val >> 6) & 0x3F] : '=';
+        *out++ = (i + 2 < len) ? b64chars[val & 0x3F] : '=';
+    }
+    *out = '\0';
+}
+
+static void sha1_hash(const unsigned char* data, size_t len, unsigned char* md) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (ctx) {
+        EVP_DigestInit_ex(ctx, EVP_sha1(), NULL);
+        EVP_DigestUpdate(ctx, data, len);
+        unsigned int md_len;
+        EVP_DigestFinal_ex(ctx, md, &md_len);
+        EVP_MD_CTX_free(ctx);
+    }
+}
+
+static int set_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+static char* find_http_header(const char* request, const char* header_name) {
+    char* pos = strstr(request, header_name);
+    if (!pos) {
+        char lower_name[64];
+        size_t len = strlen(header_name);
+        if (len < sizeof(lower_name)) {
+            for (size_t i = 0; i < len; i++) {
+                char c = header_name[i];
+                if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+                lower_name[i] = c;
+            }
+            lower_name[len] = '\0';
+            pos = strstr(request, lower_name);
+        }
+    }
+    if (!pos) return NULL;
+    pos += strlen(header_name);
+    while (*pos == ' ' || *pos == '\t') pos++;
+    return pos;
+}
+
+static void get_header_value(const char* header_start, char* dest, size_t dest_len) {
+    size_t i = 0;
+    while (header_start[i] && header_start[i] != '\r' && header_start[i] != '\n' && i < dest_len - 1) {
+        dest[i] = header_start[i];
+        i++;
+    }
+    dest[i] = '\0';
+}
+
+static int parse_websocket_frames(vnc_server_t* server, vnc_client_t* client) {
+    (void)server;
+    size_t processed = 0;
+    while (processed < client->ws_read_len) {
+        size_t remaining = client->ws_read_len - processed;
+        if (remaining < 2) break;
+
+        uint8_t* p = &client->ws_read_buf[processed];
+        uint8_t opcode = p[0] & 0x0F;
+        int has_mask = (p[1] & 0x80) != 0;
+        uint64_t payload_len = p[1] & 0x7F;
+
+        size_t header_len = 2;
+        if (payload_len == 126) {
+            if (remaining < 4) break;
+            payload_len = ((uint64_t)p[2] << 8) | p[3];
+            header_len = 4;
+        } else if (payload_len == 127) {
+            if (remaining < 10) break;
+            payload_len = 0;
+            for (int i = 0; i < 8; i++) {
+                payload_len = (payload_len << 8) | p[2 + i];
+            }
+            header_len = 10;
+        }
+
+        size_t mask_len = has_mask ? 4 : 0;
+        if (remaining < header_len + mask_len + payload_len) {
+            break;
+        }
+
+        uint8_t* mask_key = has_mask ? (p + header_len) : NULL;
+        uint8_t* payload = p + header_len + mask_len;
+
+        if (opcode == 0x8) {
+            return -1; // close/disconnect
+        } else if (opcode == 0x9) {
+            uint8_t pong_header[2] = {0x8A, 0x00};
+            send(client->fd, pong_header, 2, MSG_NOSIGNAL);
+        } else if (opcode == 0x1 || opcode == 0x2 || opcode == 0x0) {
+            if (client->read_len + payload_len > VNC_READ_BUF_SIZE) {
+                return -1; // buffer overflow
+            }
+
+            for (size_t i = 0; i < payload_len; i++) {
+                uint8_t b = payload[i];
+                if (has_mask) {
+                    b ^= mask_key[i % 4];
+                }
+                client->read_buf[client->read_len++] = b;
+            }
+        }
+
+        processed += header_len + mask_len + payload_len;
+    }
+
+    if (processed > 0) {
+        memmove(client->ws_read_buf, &client->ws_read_buf[processed], client->ws_read_len - processed);
+        client->ws_read_len -= processed;
+    }
+    return 0;
+}
+
+
+static unsigned long long get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 // --- Security helpers ---
 
@@ -172,6 +327,7 @@ vnc_server_t* vnc_server_create(const vnc_server_config_t* config) {
     server->num_blocked_ips = 0;
     server->pfds_cache = NULL;
     server->pfds_cap = 0;
+    server->websocket = config->websocket;
 
     if (!server->framebuffer || !server->server_dirty || !server->name) {
         vnc_server_destroy(server);
@@ -208,6 +364,24 @@ void vnc_server_destroy(vnc_server_t* server) {
 
 int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
     if (!server) return -1;
+
+    unsigned long long now = get_time_ms();
+    vnc_client_t* cl = server->clients;
+    while (cl) {
+        vnc_client_t* next = cl->next;
+        if (cl->state == VNC_STATE_DETECT_WEBSOCKET) {
+            if (now - cl->connect_time_ms >= 100) {
+                cl->state = VNC_STATE_PROTOCOL_VERSION;
+                const char* ver_str = "RFB 003.008\n";
+                if (client_write_raw(cl, ver_str, 12) < 0) {
+                    vnc_client_disconnect(server, cl);
+                } else {
+                    cl->state = VNC_STATE_WAIT_PROTOCOL_VERSION;
+                }
+            }
+        }
+        cl = next;
+    }
 
     // Count clients + 1 for listening socket
     int client_count = 0;
@@ -247,7 +421,6 @@ int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
 
     int ret = poll(pfds, (nfds_t)(client_count + 1), timeout_ms);
     if (ret < 0) {
-        free(pfds);
         if (errno == EINTR) return 0;
         return -1;
     }
@@ -308,10 +481,15 @@ int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
                         new_client->next = server->clients;
                         server->clients = new_client;
 
-                        // Send ProtocolVersion immediately
-                        const char* ver_str = "RFB 003.008\n";
-                        client_write_raw(new_client, ver_str, 12);
-                        new_client->state = VNC_STATE_WAIT_PROTOCOL_VERSION;
+                        if (server->websocket) {
+                            new_client->state = VNC_STATE_DETECT_WEBSOCKET;
+                            new_client->connect_time_ms = get_time_ms();
+                        } else {
+                            // Send ProtocolVersion immediately
+                            const char* ver_str = "RFB 003.008\n";
+                            client_write_raw(new_client, ver_str, 12);
+                            new_client->state = VNC_STATE_WAIT_PROTOCOL_VERSION;
+                        }
                     } else {
                         free(new_client->write_buf);
                         free(new_client->dirty_tiles);
@@ -451,8 +629,47 @@ static int disable_nagle(int fd) {
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
 }
 
-// Flush buffered client data
 static int vnc_client_flush(vnc_client_t* client) {
+    if (client->is_websocket && client->ws_handshake_done && client->write_len > 0 && client->write_pos == 0) {
+        size_t len = client->write_len;
+        size_t header_len = 0;
+        uint8_t header[10];
+        header[0] = 0x82; // FIN + Binary
+        if (len <= 125) {
+            header[1] = (uint8_t)len;
+            header_len = 2;
+        } else if (len <= 65535) {
+            header[1] = 126;
+            header[2] = (uint8_t)(len >> 8);
+            header[3] = (uint8_t)(len & 0xFF);
+            header_len = 4;
+        } else {
+            header[1] = 127;
+            header[2] = (uint8_t)((len >> 56) & 0xFF);
+            header[3] = (uint8_t)((len >> 48) & 0xFF);
+            header[4] = (uint8_t)((len >> 40) & 0xFF);
+            header[5] = (uint8_t)((len >> 32) & 0xFF);
+            header[6] = (uint8_t)((len >> 24) & 0xFF);
+            header[7] = (uint8_t)((len >> 16) & 0xFF);
+            header[8] = (uint8_t)((len >> 8) & 0xFF);
+            header[9] = (uint8_t)(len & 0xFF);
+            header_len = 10;
+        }
+
+        if (client->write_cap < len + header_len) {
+            size_t new_cap = client->write_cap * 2;
+            if (new_cap < len + header_len) new_cap = len + header_len + 65536;
+            uint8_t* new_buf = realloc(client->write_buf, new_cap);
+            if (!new_buf) return -1;
+            client->write_buf = new_buf;
+            client->write_cap = new_cap;
+        }
+
+        memmove(client->write_buf + header_len, client->write_buf, len);
+        memcpy(client->write_buf, header, header_len);
+        client->write_len += header_len;
+    }
+
     while (client->write_len > client->write_pos) {
         ssize_t n = send(client->fd, &client->write_buf[client->write_pos], client->write_len - client->write_pos, MSG_NOSIGNAL);
         if (n < 0) {
@@ -486,8 +703,6 @@ int client_ensure_write_space(vnc_client_t* client, size_t len) {
     return 0;
 }
 
-// Buffered raw write — appends to write buffer and immediately flushes.
-// Use for handshake/control messages where the client must receive data promptly.
 static int client_write_raw(vnc_client_t* client, const void* data, size_t len) {
     if (client_ensure_write_space(client, len) < 0) return -1;
     memcpy(&client->write_buf[client->write_len], data, len);
@@ -495,8 +710,6 @@ static int client_write_raw(vnc_client_t* client, const void* data, size_t len) 
     return vnc_client_flush(client);
 }
 
-// Buffered append — copies data into the write buffer WITHOUT flushing.
-// Use in the hot update path; call vnc_client_flush once at the end of the batch.
 static int client_buf_append(vnc_client_t* client, const void* data, size_t len) {
     if (client_ensure_write_space(client, len) < 0) return -1;
     memcpy(&client->write_buf[client->write_len], data, len);
@@ -568,24 +781,130 @@ static void vnc_encrypt_bytes(const char* password, const uint8_t* challenge, ui
 #pragma GCC diagnostic pop
 
 static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
-    char buf[4096];
-    ssize_t n = recv(client->fd, buf, sizeof(buf), 0);
-    if (n <= 0) {
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-        goto disconnect;
+    if (client->is_websocket && client->ws_handshake_done) {
+        char buf[4096];
+        ssize_t n = recv(client->fd, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+            goto disconnect;
+        }
+
+        if (client->ws_read_len + (size_t)n > VNC_READ_BUF_SIZE) goto disconnect;
+
+        memcpy(&client->ws_read_buf[client->ws_read_len], buf, (size_t)n);
+        client->ws_read_len += (size_t)n;
+
+        if (parse_websocket_frames(server, client) < 0) {
+            goto disconnect;
+        }
+    } else {
+        char buf[4096];
+        ssize_t n = recv(client->fd, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+            goto disconnect;
+        }
+
+        if (client->read_len + (size_t)n > VNC_READ_BUF_SIZE) goto disconnect;
+
+        memcpy(&client->read_buf[client->read_len], buf, (size_t)n);
+        client->read_len += (size_t)n;
     }
-
-    if (client->read_len + (size_t)n > VNC_READ_BUF_SIZE) goto disconnect;
-
-    memcpy(&client->read_buf[client->read_len], buf, (size_t)n);
-    client->read_len += (size_t)n;
 
     size_t processed = 0;
     while (processed < client->read_len) {
         size_t remaining = client->read_len - processed;
         uint8_t* p = &client->read_buf[processed];
 
-        if (client->state == VNC_STATE_WAIT_PROTOCOL_VERSION) {
+        if (client->state == VNC_STATE_DETECT_WEBSOCKET) {
+            if (remaining >= 4) {
+                if (memcmp(p, "GET ", 4) == 0) {
+                    char* end_headers = strstr((char*)p, "\r\n\r\n");
+                    if (!end_headers) {
+                        break;
+                    }
+                    size_t headers_len = (end_headers + 4) - (char*)p;
+
+                    char* upgrade = find_http_header((char*)p, "Upgrade:");
+                    char* ws_key_hdr = find_http_header((char*)p, "Sec-WebSocket-Key:");
+
+                    int is_ws_upgrade = 0;
+                    if (upgrade && ws_key_hdr) {
+                        char upgrade_val[64];
+                        get_header_value(upgrade, upgrade_val, sizeof(upgrade_val));
+                        if (case_insensitive_strstr(upgrade_val, "websocket")) {
+                            is_ws_upgrade = 1;
+                        }
+                    }
+
+                    if (is_ws_upgrade) {
+                        char ws_key[128];
+                        get_header_value(ws_key_hdr, ws_key, sizeof(ws_key));
+
+                        char concat[256];
+                        snprintf(concat, sizeof(concat), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", ws_key);
+
+                        unsigned char sha1_res[20];
+                        sha1_hash((unsigned char*)concat, strlen(concat), sha1_res);
+
+                        char accept_key[128];
+                        base64_encode(sha1_res, 20, accept_key);
+
+                        char handshake_resp[512];
+                        int resp_len = snprintf(handshake_resp, sizeof(handshake_resp),
+                            "HTTP/1.1 101 Switching Protocols\r\n"
+                            "Upgrade: websocket\r\n"
+                            "Connection: Upgrade\r\n"
+                            "Sec-WebSocket-Accept: %s\r\n"
+                            "\r\n", accept_key);
+
+                        if (send(client->fd, handshake_resp, resp_len, MSG_NOSIGNAL) < 0) {
+                            goto disconnect;
+                        }
+
+                        client->is_websocket = 1;
+                        client->ws_handshake_done = 1;
+                        client->state = VNC_STATE_PROTOCOL_VERSION;
+
+                        processed += headers_len;
+
+                        const char* ver_str = "RFB 003.008\n";
+                        client_write_raw(client, ver_str, 12);
+                        client->state = VNC_STATE_WAIT_PROTOCOL_VERSION;
+                    } else {
+                        set_blocking(client->fd);
+
+                        char resp_hdr[256];
+                        int hdr_len = snprintf(resp_hdr, sizeof(resp_hdr),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/html\r\n"
+                            "Content-Length: %u\r\n"
+                            "Connection: close\r\n"
+                            "\r\n", vnc_lite_standalone_html_len);
+
+                        send(client->fd, resp_hdr, hdr_len, MSG_NOSIGNAL);
+
+                        size_t total_sent = 0;
+                        while (total_sent < vnc_lite_standalone_html_len) {
+                            ssize_t sent = send(client->fd, vnc_lite_standalone_html + total_sent, 
+                                                vnc_lite_standalone_html_len - total_sent, MSG_NOSIGNAL);
+                            if (sent <= 0) break;
+                            total_sent += sent;
+                        }
+
+                        goto disconnect;
+                    }
+                } else {
+                    client->state = VNC_STATE_PROTOCOL_VERSION;
+                    const char* ver_str = "RFB 003.008\n";
+                    if (send(client->fd, ver_str, 12, MSG_NOSIGNAL) < 0) goto disconnect;
+                    client->state = VNC_STATE_WAIT_PROTOCOL_VERSION;
+                }
+            } else {
+                break;
+            }
+        }
+        else if (client->state == VNC_STATE_WAIT_PROTOCOL_VERSION) {
             if (remaining < 12) break;
             if (memcmp(p, "RFB 003.", 8) != 0) goto disconnect;
             
@@ -790,7 +1109,6 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
             else if (msg_type == 6) { // ClientCutText
                 if (remaining < 8) break;
                 uint32_t length = read_u32_be(p + 4);
-                // Reject payloads too large for the read buffer (prevents DoS stall)
                 if (length > (uint32_t)VNC_CLIPBOARD_MAX_LEN) goto disconnect;
                 if (remaining < 8 + (size_t)length) break;
                 processed += 8 + (size_t)length;

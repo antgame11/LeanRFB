@@ -7,6 +7,10 @@ LeanRFB is a fast, lightweight, and secure VNC (RFB protocol) server library wri
 
 ## Features
 
+- **Integrated Web & WebSocket Support**:
+  - Auto-detects WebSocket (noVNC) vs. standard VNC clients on the same port with a negligible 100ms auto-negotiation window.
+  - Serves the standalone HTML client (`vnc_lite_standalone.html`) directly via HTTP GET requests.
+  - Native binary WebSocket frame encapsulation (supports cursor updates, JPEG, and Hextile encodings) out-of-the-box, removing the need for external tools like `websockify`.
 - **High Performance**: 
   - Adaptive tile change detection with early-exit row comparison.
   - Zero-allocation network polling loops (cached pollfd context).
@@ -15,15 +19,19 @@ LeanRFB is a fast, lightweight, and secure VNC (RFB protocol) server library wri
 - **Robust Security**:
   - Constant-time memory comparison for authentication challenges (mitigates timing side-channel attacks).
   - Hard failure on insecure challenge generation (requires cryptographically secure entropy from `/dev/urandom`).
-  - Strict maximum connection limits.
   - IP brute-force rate-limiting and temporary lockout blocks.
-  - Strict validation of client-supplied pixel format depths (`bpp` validated to $\{8, 16, 32\}$).
   - Size-bounded clipboard inputs (prevents denial-of-service memory exhaustions via massive `ClientCutText` messages).
   - Strict Unix SHM permission limits (created with `0600` permissions rather than world-accessible `0777`).
 
+## Codebase Structure
+
+- **`src/` and `include/`**: The core library (`leanrfb`) implementation and API headers.
+- **`x11_vnc/`**: The main first-class application (`x11_vnc_server`), containing its source, configuration (`x11_vnc_server.conf`), and standalone HTML client asset.
+- **`examples/`**: Minimal examples using the library (e.g. `demo_server.c`).
+
 ## Build Instructions
 
-To build the static library `libleanrfb.a` and the examples, run:
+To build the static library `libleanrfb.a`, the `demo_server` example, and the `x11_vnc_server` program, run:
 
 ```bash
 make
@@ -35,23 +43,25 @@ To clean up intermediate object files and executables:
 make clean
 ```
 
-## Running the Examples
+## Running the Applications
 
-### 1. Demo Server
+### 1. X11 VNC Server
+Shares your active X11 desktop session:
+
+```bash
+./x11_vnc_server [port] [password]
+```
+
+By default, the server reads options from `x11_vnc/x11_vnc_server.conf`. You can toggle the WebSocket/HTTP server on the same port by setting `websocket=y` in the configuration. When enabled, navigating to `http://localhost:<port>/` in your web browser will serve the standalone noVNC web client, which connects back to the VNC session via WebSocket automatically.
+
+*Note: The password string passed on the command line is immediately wiped from the process's `argv` space to prevent disclosure via local process listing utilities (like `ps`).*
+
+### 2. Demo Server (Example)
 A simple programmatic test server that creates a basic memory framebuffer:
 
 ```bash
 ./demo_server <port> [password]
 ```
-
-### 2. X11 VNC Server
-Shares your active X11 desktop session:
-
-```bash
-./x11_vnc_server <port> [password]
-```
-
-*Note: The password string passed on the command line is immediately wiped from the process's `argv` space to prevent disclosure via local process listing utilities (like `ps`).*
 
 ## API Usage
 
