@@ -1,0 +1,10 @@
+# Object files
+src/*.o
+examples/*.o
+
+# Libraries
+*.a
+
+# Executables
+demo_server
+x11_vnc_server

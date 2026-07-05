@@ -1,0 +1,1083 @@
+#define _DEFAULT_SOURCE
+#include "leanrfb_internal.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <openssl/des.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <poll.h>
+
+// Forward declarations of internal helpers
+static int set_nonblocking(int fd);
+static int disable_nagle(int fd);
+static int vnc_client_flush(vnc_client_t* client);
+static int client_write_raw(vnc_client_t* client, const void* data, size_t len);
+static void vnc_client_disconnect(vnc_server_t* server, vnc_client_t* client);
+static void client_read_handler(vnc_server_t* server, vnc_client_t* client);
+static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client);
+
+// --- Security helpers ---
+
+// Constant-time memory comparison — prevents timing side-channel attacks.
+// Returns 1 if all n bytes match, 0 otherwise.
+static int mem_equal_ct(const uint8_t* a, const uint8_t* b, size_t n) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++) {
+        diff |= a[i] ^ b[i];
+    }
+    return diff == 0;
+}
+
+// Fill buf with len cryptographically secure random bytes from /dev/urandom.
+// Returns 0 on success, -1 on failure (caller must disconnect the client).
+static int secure_random_bytes(uint8_t* buf, size_t len) {
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, len, f);
+    fclose(f);
+    return (n == len) ? 0 : -1;
+}
+
+// Returns 1 if ip is in the server's blocked list and the block has not expired.
+// Expired entries are removed lazily.
+static int ip_is_blocked(vnc_server_t* server, const char* ip) {
+    time_t now = time(NULL);
+    for (int i = 0; i < server->num_blocked_ips; ) {
+        if (strcmp(server->blocked_ips[i].ip, ip) == 0) {
+            if (now < server->blocked_ips[i].block_until) {
+                return 1;
+            }
+            // Expired — swap with the last entry and shrink the list
+            server->blocked_ips[i] = server->blocked_ips[--server->num_blocked_ips];
+            return 0;
+        }
+        i++;
+    }
+    return 0;
+}
+
+// Record a failed authentication attempt; blocks the source IP when the threshold
+// (VNC_AUTH_MAX_FAILS failures within VNC_AUTH_WINDOW_SEC seconds) is exceeded.
+static void record_auth_failure(vnc_server_t* server, vnc_client_t* client) {
+    time_t now = time(NULL);
+    if (client->auth_fail_count == 0 ||
+        now - client->auth_first_fail_time > VNC_AUTH_WINDOW_SEC) {
+        client->auth_fail_count = 1;
+        client->auth_first_fail_time = now;
+    } else {
+        client->auth_fail_count++;
+    }
+
+    if (client->auth_fail_count >= VNC_AUTH_MAX_FAILS) {
+        fprintf(stderr, "[VNC SERVER] Blocking %s after %d auth failures\n",
+                client->client_ip, client->auth_fail_count);
+        fflush(stderr);
+        int found = 0;
+        for (int i = 0; i < server->num_blocked_ips; i++) {
+            if (strcmp(server->blocked_ips[i].ip, client->client_ip) == 0) {
+                server->blocked_ips[i].block_until = now + VNC_AUTH_BLOCK_SEC;
+                found = 1;
+                break;
+            }
+        }
+        if (!found && server->num_blocked_ips < VNC_MAX_BLOCKED_IPS) {
+            memcpy(server->blocked_ips[server->num_blocked_ips].ip,
+                   client->client_ip, INET_ADDRSTRLEN);
+            server->blocked_ips[server->num_blocked_ips].block_until = now + VNC_AUTH_BLOCK_SEC;
+            server->num_blocked_ips++;
+        }
+    }
+}
+
+vnc_server_t* vnc_server_create(const vnc_server_config_t* config) {
+    if (!config || config->width == 0 || config->height == 0) {
+        return NULL;
+    }
+
+    int port = config->port <= 0 ? 5900 : config->port;
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        return NULL;
+    }
+
+    int reuse = 1;
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        close(listen_fd);
+        return NULL;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (config->listen_host) {
+        if (inet_pton(AF_INET, config->listen_host, &addr.sin_addr) <= 0) {
+            close(listen_fd);
+            return NULL;
+        }
+    } else {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }
+
+    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(listen_fd);
+        return NULL;
+    }
+
+    if (listen(listen_fd, 10) < 0) {
+        close(listen_fd);
+        return NULL;
+    }
+
+    if (set_nonblocking(listen_fd) < 0) {
+        close(listen_fd);
+        return NULL;
+    }
+
+    vnc_server_t* server = (vnc_server_t*)malloc(sizeof(vnc_server_t));
+    if (!server) {
+        close(listen_fd);
+        return NULL;
+    }
+
+    server->listen_fd = listen_fd;
+    server->width = config->width;
+    server->height = config->height;
+    server->name = strdup(config->name ? config->name : "VNC Server");
+    
+    server->cols = (config->width + 15) / 16;
+    server->rows = (config->height + 15) / 16;
+    
+    server->framebuffer = (uint32_t*)calloc((size_t)server->width * server->height, sizeof(uint32_t));
+    server->server_dirty = (uint8_t*)calloc((size_t)server->cols * server->rows, sizeof(uint8_t));
+    
+    server->clients = NULL;
+    server->cursor_pixels = NULL;
+    server->cursor_w = 0;
+    server->cursor_h = 0;
+    server->cursor_xhot = 0;
+    server->cursor_yhot = 0;
+    server->on_key = config->on_key;
+    server->on_pointer = config->on_pointer;
+    server->user_data = config->user_data;
+    server->password = config->password ? strdup(config->password) : NULL;
+    server->max_clients = (config->max_clients > 0) ? config->max_clients : VNC_MAX_CLIENTS_DEFAULT;
+    server->num_blocked_ips = 0;
+    server->pfds_cache = NULL;
+    server->pfds_cap = 0;
+
+    if (!server->framebuffer || !server->server_dirty || !server->name) {
+        vnc_server_destroy(server);
+        return NULL;
+    }
+
+    return server;
+}
+
+void vnc_server_destroy(vnc_server_t* server) {
+    if (!server) return;
+
+    if (server->listen_fd >= 0) {
+        close(server->listen_fd);
+    }
+
+    vnc_client_t* client = server->clients;
+    while (client) {
+        vnc_client_t* next = client->next;
+        if (client->fd >= 0) close(client->fd);
+        free(client->dirty_tiles);
+        free(client);
+        client = next;
+    }
+
+    free(server->framebuffer);
+    free(server->server_dirty);
+    free(server->cursor_pixels);
+    free(server->password);
+    free(server->name);
+    free(server->pfds_cache);
+    free(server);
+}
+
+int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
+    if (!server) return -1;
+
+    // Count clients + 1 for listening socket
+    int client_count = 0;
+    vnc_client_t* client = server->clients;
+    while (client) {
+        client_count++;
+        client = client->next;
+    }
+
+    // Grow the cached pollfd array if needed (avoids malloc/free on every poll call)
+    int needed = client_count + 1;
+    if (needed > server->pfds_cap) {
+        int new_cap = needed + 8; // over-allocate a bit to avoid frequent reallocs
+        struct pollfd* new_pfds = realloc(server->pfds_cache, (size_t)new_cap * sizeof(struct pollfd));
+        if (!new_pfds) return -1;
+        server->pfds_cache = new_pfds;
+        server->pfds_cap = new_cap;
+    }
+    struct pollfd* pfds = server->pfds_cache;
+
+    pfds[0].fd = server->listen_fd;
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+
+    int idx = 1;
+    client = server->clients;
+    while (client) {
+        pfds[idx].fd = client->fd;
+        pfds[idx].events = POLLIN;
+        if (client->write_len > client->write_pos) {
+            pfds[idx].events |= POLLOUT;
+        }
+        pfds[idx].revents = 0;
+        idx++;
+        client = client->next;
+    }
+
+    int ret = poll(pfds, (nfds_t)(client_count + 1), timeout_ms);
+    if (ret < 0) {
+        free(pfds);
+        if (errno == EINTR) return 0;
+        return -1;
+    }
+
+    // 1. Check for new connections
+    if (pfds[0].revents & POLLIN) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server->listen_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd >= 0) {
+            // Extract remote IP before any further checks
+            char ip_str[INET_ADDRSTRLEN];
+            if (!inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str))) {
+                snprintf(ip_str, sizeof(ip_str), "unknown");
+            }
+
+            if (client_count >= server->max_clients) {
+                // Hard connection limit reached — reject silently
+                fprintf(stderr, "[VNC SERVER] Connection limit (%d) reached, rejecting %s\n",
+                        server->max_clients, ip_str);
+                fflush(stderr);
+                close(client_fd);
+            } else if (ip_is_blocked(server, ip_str)) {
+                // Source IP is temporarily blocked due to repeated auth failures
+                fprintf(stderr, "[VNC SERVER] Rejected connection from blocked IP %s\n", ip_str);
+                fflush(stderr);
+                close(client_fd);
+            } else if (set_nonblocking(client_fd) == 0 && disable_nagle(client_fd) == 0) {
+                int sndbuf = 1024 * 1024;
+                setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, sizeof(sndbuf));
+                vnc_client_t* new_client = (vnc_client_t*)calloc(1, sizeof(vnc_client_t));
+                if (new_client) {
+                    new_client->fd = client_fd;
+
+                    snprintf(new_client->ip_addr, sizeof(new_client->ip_addr),
+                             "%s:%d", ip_str, ntohs(client_addr.sin_port));
+                    memcpy(new_client->client_ip, ip_str, INET_ADDRSTRLEN);
+
+                    printf("[VNC SERVER] Client connected from %s\n", new_client->ip_addr);
+                    fflush(stdout);
+
+                    new_client->state = VNC_STATE_PROTOCOL_VERSION;
+                    new_client->protocol_minor = 8;
+                    // Initial format: same as server default (32-bit BGRA)
+                    new_client->fmt = (vnc_pixel_fmt_t){32, 24, 0, 1, 255, 255, 255, 16, 8, 0, {0}};
+                    new_client->format_custom = 0;
+                    new_client->supports_hextile = 0;
+                    new_client->supports_rich_cursor = 0;
+                    new_client->send_cursor_update = 1;
+
+                    new_client->write_cap = VNC_WRITE_BUF_INIT_SIZE;
+                    new_client->write_buf = malloc(new_client->write_cap);
+                    new_client->dirty_tiles = malloc((size_t)server->cols * server->rows);
+                    if (new_client->write_buf && new_client->dirty_tiles) {
+                        // Mark all tiles dirty on connect to send initial full screen
+                        memset(new_client->dirty_tiles, 1, (size_t)server->cols * server->rows);
+
+                        new_client->next = server->clients;
+                        server->clients = new_client;
+
+                        // Send ProtocolVersion immediately
+                        const char* ver_str = "RFB 003.008\n";
+                        client_write_raw(new_client, ver_str, 12);
+                        new_client->state = VNC_STATE_WAIT_PROTOCOL_VERSION;
+                    } else {
+                        free(new_client->write_buf);
+                        free(new_client->dirty_tiles);
+                        free(new_client);
+                        close(client_fd);
+                    }
+                } else {
+                    close(client_fd);
+                }
+            } else {
+                close(client_fd);
+            }
+        }
+    }
+
+    // 2. Check client sockets
+    idx = 1;
+    client = server->clients;
+    while (client) {
+        vnc_client_t* next_client = client->next; // save next in case client disconnects
+        
+        if (pfds[idx].revents & POLLOUT) {
+            vnc_client_flush(client);
+        }
+        
+        if (pfds[idx].revents & POLLIN) {
+            client_read_handler(server, client);
+        } else if (pfds[idx].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            vnc_client_disconnect(server, client);
+        }
+        
+        idx++;
+        client = next_client;
+    }
+
+    // 3. Process pending updates for connected, initialized clients
+    client = server->clients;
+    while (client) {
+        if (client->state == VNC_STATE_NORMAL && client->update_requested) {
+            vnc_client_send_update(server, client);
+        }
+        client = client->next;
+    }
+
+    return 0;
+}
+
+void vnc_server_update_framebuffer(vnc_server_t* server, const uint32_t* fb_data) {
+    if (!server || !fb_data) return;
+
+    for (int r = 0; r < server->rows; r++) {
+        int ty = r * 16;
+        int th = (server->height - ty < 16) ? (server->height - ty) : 16;
+
+        for (int c = 0; c < server->cols; c++) {
+            int tx = c * 16;
+            int tw = (server->width - tx < 16) ? (server->width - tx) : 16;
+            size_t row_bytes = (size_t)tw * 4;
+
+            // Phase 1: compare rows until we find a difference
+            int changed = 0;
+            int y = 0;
+            for (; y < th; y++) {
+                size_t offset = (ty + y) * (size_t)server->width + tx;
+                if (memcmp(&server->framebuffer[offset], &fb_data[offset], row_bytes) != 0) {
+                    memcpy(&server->framebuffer[offset], &fb_data[offset], row_bytes);
+                    changed = 1;
+                    y++;
+                    break; // switch to copy-only mode for remaining rows
+                }
+            }
+            // Phase 2: once changed, just copy remaining rows without comparing
+            for (; y < th; y++) {
+                size_t offset = (ty + y) * (size_t)server->width + tx;
+                memcpy(&server->framebuffer[offset], &fb_data[offset], row_bytes);
+            }
+
+            if (changed) {
+                server->server_dirty[r * server->cols + c] = 1;
+                vnc_client_t* cl = server->clients;
+                while (cl) {
+                    cl->dirty_tiles[r * server->cols + c] = 1;
+                    cl = cl->next;
+                }
+            }
+        }
+    }
+}
+
+void vnc_server_update_rect(vnc_server_t* server, const uint32_t* rect_data, uint16_t rx, uint16_t ry, uint16_t rw, uint16_t rh) {
+    if (!server || !rect_data || rx + rw > server->width || ry + rh > server->height) return;
+
+    for (int y = 0; y < rh; y++) {
+        size_t dest_offset = (ry + y) * (size_t)server->width + rx;
+        size_t src_offset = y * (size_t)rw;
+        memcpy(&server->framebuffer[dest_offset], &rect_data[src_offset], (size_t)rw * 4);
+    }
+
+    vnc_server_mark_dirty(server, rx, ry, rw, rh);
+}
+
+void vnc_server_mark_dirty(vnc_server_t* server, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    if (!server || w == 0 || h == 0) return;
+
+    int start_col = x / 16;
+    int end_col = (x + w - 1) / 16;
+    int start_row = y / 16;
+    int end_row = (y + h - 1) / 16;
+
+    if (start_col < 0) start_col = 0;
+    if (end_col >= server->cols) end_col = server->cols - 1;
+    if (start_row < 0) start_row = 0;
+    if (end_row >= server->rows) end_row = server->rows - 1;
+
+    for (int r = start_row; r <= end_row; r++) {
+        for (int c = start_col; c <= end_col; c++) {
+            server->server_dirty[r * server->cols + c] = 1;
+            vnc_client_t* client = server->clients;
+            while (client) {
+                client->dirty_tiles[r * server->cols + c] = 1;
+                client = client->next;
+            }
+        }
+    }
+}
+
+// Socket non-blocking helper
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+// TCP_NODELAY helper
+static int disable_nagle(int fd) {
+    int flag = 1;
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
+}
+
+// Flush buffered client data
+static int vnc_client_flush(vnc_client_t* client) {
+    while (client->write_len > client->write_pos) {
+        ssize_t n = send(client->fd, &client->write_buf[client->write_pos], client->write_len - client->write_pos, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0; // standard non-blocking return
+            }
+            return -1; // real error
+        }
+        client->write_pos += n;
+    }
+    // Buffer fully flushed
+    client->write_len = 0;
+    client->write_pos = 0;
+    return 0;
+}
+
+int client_ensure_write_space(vnc_client_t* client, size_t len) {
+    if (client->write_cap - client->write_len < len) {
+        vnc_client_flush(client);
+        if (client->write_cap - client->write_len < len) {
+            size_t new_cap = client->write_cap * 2;
+            if (new_cap < client->write_len + len) {
+                new_cap = client->write_len + len + 65536;
+            }
+            uint8_t* new_buf = realloc(client->write_buf, new_cap);
+            if (!new_buf) return -1;
+            client->write_buf = new_buf;
+            client->write_cap = new_cap;
+        }
+    }
+    return 0;
+}
+
+// Buffered raw write — appends to write buffer and immediately flushes.
+// Use for handshake/control messages where the client must receive data promptly.
+static int client_write_raw(vnc_client_t* client, const void* data, size_t len) {
+    if (client_ensure_write_space(client, len) < 0) return -1;
+    memcpy(&client->write_buf[client->write_len], data, len);
+    client->write_len += len;
+    return vnc_client_flush(client);
+}
+
+// Buffered append — copies data into the write buffer WITHOUT flushing.
+// Use in the hot update path; call vnc_client_flush once at the end of the batch.
+static int client_buf_append(vnc_client_t* client, const void* data, size_t len) {
+    if (client_ensure_write_space(client, len) < 0) return -1;
+    memcpy(&client->write_buf[client->write_len], data, len);
+    client->write_len += len;
+    return 0;
+}
+
+static void vnc_client_disconnect(vnc_server_t* server, vnc_client_t* client) {
+    if (!server || !client) return;
+
+    printf("[VNC SERVER] Client disconnected: %s\n", client->ip_addr);
+    fflush(stdout);
+
+    // Remove from linked list
+    vnc_client_t* prev = NULL;
+    vnc_client_t* curr = server->clients;
+    while (curr) {
+        if (curr == client) {
+            if (prev) {
+                prev->next = curr->next;
+            } else {
+                server->clients = curr->next;
+            }
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    if (client->fd >= 0) {
+        close(client->fd);
+    }
+    free(client->dirty_tiles);
+    free(client);
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+static void vnc_encrypt_bytes(const char* password, const uint8_t* challenge, uint8_t* response) {
+    unsigned char key[8] = {0};
+    size_t pass_len = strlen(password);
+    for (int i = 0; i < 8; i++) {
+        unsigned char b = (i < (int)pass_len) ? (unsigned char)password[i] : 0;
+        unsigned char rev = 0;
+        for (int bit = 0; bit < 8; bit++) {
+            if (b & (1 << bit)) {
+                rev |= (1 << (7 - bit));
+            }
+        }
+        key[i] = rev;
+    }
+
+    DES_cblock des_key;
+    memcpy(&des_key, key, 8);
+    DES_key_schedule schedule;
+    DES_set_key(&des_key, &schedule);
+
+    DES_cblock in1, out1;
+    DES_cblock in2, out2;
+    memcpy(&in1, challenge, 8);
+    memcpy(&in2, challenge + 8, 8);
+
+    DES_ecb_encrypt(&in1, &out1, &schedule, DES_ENCRYPT);
+    DES_ecb_encrypt(&in2, &out2, &schedule, DES_ENCRYPT);
+
+    memcpy(response, &out1, 8);
+    memcpy(response + 8, &out2, 8);
+}
+#pragma GCC diagnostic pop
+
+static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
+    char buf[4096];
+    ssize_t n = recv(client->fd, buf, sizeof(buf), 0);
+    if (n <= 0) {
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        goto disconnect;
+    }
+
+    if (client->read_len + (size_t)n > VNC_READ_BUF_SIZE) goto disconnect;
+
+    memcpy(&client->read_buf[client->read_len], buf, (size_t)n);
+    client->read_len += (size_t)n;
+
+    size_t processed = 0;
+    while (processed < client->read_len) {
+        size_t remaining = client->read_len - processed;
+        uint8_t* p = &client->read_buf[processed];
+
+        if (client->state == VNC_STATE_WAIT_PROTOCOL_VERSION) {
+            if (remaining < 12) break;
+            if (memcmp(p, "RFB 003.", 8) != 0) goto disconnect;
+            
+            char minor_str[4] = {0};
+            memcpy(minor_str, p + 8, 3);
+            client->protocol_minor = atoi(minor_str);
+            processed += 12;
+
+            int has_pwd = (server->password && strlen(server->password) > 0);
+
+            if (client->protocol_minor < 7) {
+                if (has_pwd) {
+                    // RFB 3.3: Send chosen security type directly (4 bytes: VncAuth = 2)
+                    uint8_t sec_type[4] = {0, 0, 0, 2};
+                    if (client_write_raw(client, sec_type, 4) < 0) goto disconnect;
+                    
+                    // Generate 16-byte random challenge (hard-fail if entropy unavailable)
+                    if (secure_random_bytes(client->challenge, 16) < 0) goto disconnect;
+                    
+                    if (client_write_raw(client, client->challenge, 16) < 0) goto disconnect;
+                    client->state = VNC_STATE_WAIT_VNC_AUTH_RESPONSE;
+                } else {
+                    // RFB 3.3: Send chosen security type directly (4 bytes: None = 1)
+                    uint8_t sec_type[4] = {0, 0, 0, 1};
+                    if (client_write_raw(client, sec_type, 4) < 0) goto disconnect;
+                    client->state = VNC_STATE_WAIT_CLIENT_INIT;
+                }
+            } else {
+                // RFB 3.7 or 3.8: Send list of security types (1 type: VncAuth=2 or None=1)
+                uint8_t sec_types[2];
+                sec_types[0] = 1;
+                sec_types[1] = has_pwd ? 2 : 1;
+                if (client_write_raw(client, sec_types, 2) < 0) goto disconnect;
+                client->state = VNC_STATE_WAIT_SECURITY;
+            }
+        }
+        else if (client->state == VNC_STATE_WAIT_SECURITY) {
+            if (remaining < 1) break;
+            uint8_t chosen_type = p[0];
+            processed += 1;
+
+            int has_pwd = (server->password && strlen(server->password) > 0);
+
+            if (has_pwd) {
+                if (chosen_type != 2) goto disconnect; // Must choose VncAuth (2)
+
+                    // Generate 16-byte random challenge (hard-fail if entropy unavailable)
+                    if (secure_random_bytes(client->challenge, 16) < 0) goto disconnect;
+
+                if (client_write_raw(client, client->challenge, 16) < 0) goto disconnect;
+                client->state = VNC_STATE_WAIT_VNC_AUTH_RESPONSE;
+            } else {
+                if (chosen_type != 1) goto disconnect; // Must choose None (1)
+                
+                if (client->protocol_minor >= 8) {
+                    // RFB 3.8: Send SecurityResult (Success = 0)
+                    uint8_t sec_res[4] = {0, 0, 0, 0};
+                    if (client_write_raw(client, sec_res, 4) < 0) goto disconnect;
+                }
+                client->state = VNC_STATE_WAIT_CLIENT_INIT;
+            }
+        }
+        else if (client->state == VNC_STATE_WAIT_VNC_AUTH_RESPONSE) {
+            if (remaining < 16) break;
+            processed += 16;
+
+            // Generate expected response
+            uint8_t expected[16];
+            vnc_encrypt_bytes(server->password, client->challenge, expected);
+
+            if (mem_equal_ct(expected, p, 16)) {
+                // Send SecurityResult (Success = 0)
+                uint8_t sec_res[4] = {0, 0, 0, 0};
+                if (client_write_raw(client, sec_res, 4) < 0) goto disconnect;
+                client->state = VNC_STATE_WAIT_CLIENT_INIT;
+            } else {
+                record_auth_failure(server, client);
+                // Send SecurityResult (Failure = 1)
+                uint8_t sec_res[4] = {0, 0, 0, 1};
+                client_write_raw(client, sec_res, 4);
+                goto disconnect;
+            }
+        }
+        else if (client->state == VNC_STATE_WAIT_CLIENT_INIT) {
+            if (remaining < 1) break;
+            // shared-flag (ignored, but read)
+            processed += 1;
+
+            // ServerInit
+            size_t name_len = strlen(server->name);
+            size_t init_msg_size = 2 + 2 + 16 + 4 + name_len;
+            uint8_t* init_msg = malloc(init_msg_size);
+            if (!init_msg) goto disconnect;
+
+            write_u16_be(init_msg + 0, server->width);
+            write_u16_be(init_msg + 2, server->height);
+
+            // BGRA 32-bit pixel format
+            init_msg[4] = 32; // bits-per-pixel
+            init_msg[5] = 24; // depth
+            init_msg[6] = 0;  // big-endian
+            init_msg[7] = 1;  // true-color
+            write_u16_be(init_msg + 8, 255); // red-max
+            write_u16_be(init_msg + 10, 255); // green-max
+            write_u16_be(init_msg + 12, 255); // blue-max
+            init_msg[14] = 16; // red-shift
+            init_msg[15] = 8;  // green-shift
+            init_msg[16] = 0;  // blue-shift
+            memset(init_msg + 17, 0, 3); // padding
+
+            write_u32_be(init_msg + 20, (uint32_t)name_len);
+            memcpy(init_msg + 24, server->name, name_len);
+
+            int write_res = client_write_raw(client, init_msg, init_msg_size);
+            free(init_msg);
+            if (write_res < 0) goto disconnect;
+
+            client->state = VNC_STATE_NORMAL;
+        }
+        else if (client->state == VNC_STATE_NORMAL) {
+            uint8_t msg_type = p[0];
+            if (msg_type == 0) { // SetPixelFormat
+                if (remaining < 20) break;
+                {
+                    uint8_t new_bpp = p[4];
+                    if (new_bpp != 8 && new_bpp != 16 && new_bpp != 32) goto disconnect;
+                    client->fmt.bits_per_pixel = new_bpp;
+                }
+                client->fmt.depth = p[5];
+                client->fmt.big_endian_flag = p[6];
+                client->fmt.true_color_flag = p[7];
+                client->fmt.red_max = read_u16_be(p + 8);
+                client->fmt.green_max = read_u16_be(p + 10);
+                client->fmt.blue_max = read_u16_be(p + 12);
+                client->fmt.red_shift = p[14];
+                client->fmt.green_shift = p[15];
+                client->fmt.blue_shift = p[16];
+
+                vnc_pixel_fmt_t def_fmt = {32, 24, 0, 1, 255, 255, 255, 16, 8, 0, {0}};
+                client->format_custom = !pixel_format_equal(&client->fmt, &def_fmt);
+                processed += 20;
+            }
+            else if (msg_type == 2) { // SetEncodings
+                if (remaining < 4) break;
+                uint16_t num_encodings = read_u16_be(p + 2);
+                if (remaining < 4 + (size_t)num_encodings * 4) break;
+
+                client->supports_hextile = 0;
+                client->supports_tight = 0;
+                client->supports_rich_cursor = 0;
+                printf("[VNC SERVER] Client supports encodings: ");
+                for (int i = 0; i < num_encodings; i++) {
+                    int32_t enc = (int32_t)read_u32_be(p + 4 + i * 4);
+                    printf("%d ", enc);
+                    if (enc == 5) {
+                        client->supports_hextile = 1;
+                    } else if (enc == 7) {
+                        client->supports_tight = 1;
+                    } else if (enc == -239) {
+                        client->supports_rich_cursor = 1;
+                    }
+                }
+                printf("\n");
+                fflush(stdout);
+                processed += 4 + (size_t)num_encodings * 4;
+            }
+            else if (msg_type == 3) { // FramebufferUpdateRequest
+                if (remaining < 10) break;
+                uint8_t incremental = p[1];
+                uint16_t x = read_u16_be(p + 2);
+                uint16_t y = read_u16_be(p + 4);
+                uint16_t w = read_u16_be(p + 6);
+                uint16_t h = read_u16_be(p + 8);
+
+                client->update_requested = 1;
+                client->update_incremental = incremental;
+                client->req_x = x;
+                client->req_y = y;
+                client->req_w = w;
+                client->req_h = h;
+                processed += 10;
+            }
+            else if (msg_type == 4) { // KeyEvent
+                if (remaining < 8) break;
+                uint8_t down_flag = p[1];
+                uint32_t keysym = read_u32_be(p + 4);
+                if (server->on_key) {
+                    server->on_key(server, client, keysym, down_flag, server->user_data);
+                }
+                processed += 8;
+            }
+            else if (msg_type == 5) { // PointerEvent
+                if (remaining < 6) break;
+                uint8_t button_mask = p[1];
+                uint16_t x = read_u16_be(p + 2);
+                uint16_t y = read_u16_be(p + 4);
+                if (server->on_pointer) {
+                    server->on_pointer(server, client, x, y, button_mask, server->user_data);
+                }
+                processed += 6;
+            }
+            else if (msg_type == 6) { // ClientCutText
+                if (remaining < 8) break;
+                uint32_t length = read_u32_be(p + 4);
+                // Reject payloads too large for the read buffer (prevents DoS stall)
+                if (length > (uint32_t)VNC_CLIPBOARD_MAX_LEN) goto disconnect;
+                if (remaining < 8 + (size_t)length) break;
+                processed += 8 + (size_t)length;
+            }
+            else {
+                goto disconnect;
+            }
+        }
+    }
+
+    if (processed > 0) {
+        memmove(client->read_buf, &client->read_buf[processed], client->read_len - processed);
+        client->read_len -= processed;
+    }
+    return;
+
+disconnect:
+    vnc_client_disconnect(server, client);
+}
+
+static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client) {
+    if (client->write_len > client->write_pos) return;
+
+    client->write_len = 0;
+    client->write_pos = 0;
+
+    if (client->send_cursor_update && client->supports_rich_cursor && server->cursor_pixels) {
+        size_t mask_bytes_per_row = (server->cursor_w + 7) / 8;
+        size_t bpp = get_pixel_size(&client->fmt, client->format_custom);
+        size_t cursor_size = 4 + 12 + (size_t)server->cursor_w * server->cursor_h * bpp + (size_t)server->cursor_h * mask_bytes_per_row;
+        
+        if (client_ensure_write_space(client, cursor_size) == 0) {
+            // Write FramebufferUpdate header (1 rect)
+            client->write_buf[client->write_len++] = 0;
+            client->write_buf[client->write_len++] = 0;
+            client->write_buf[client->write_len++] = 0;
+            client->write_buf[client->write_len++] = 1;
+            
+            // Write rect header
+            write_u16_be(&client->write_buf[client->write_len], server->cursor_xhot);
+            client->write_len += 2;
+            write_u16_be(&client->write_buf[client->write_len], server->cursor_yhot);
+            client->write_len += 2;
+            write_u16_be(&client->write_buf[client->write_len], server->cursor_w);
+            client->write_len += 2;
+            write_u16_be(&client->write_buf[client->write_len], server->cursor_h);
+            client->write_len += 2;
+            write_u32_be(&client->write_buf[client->write_len], (uint32_t)-239);
+            client->write_len += 4;
+            
+            // Convert and write pixels
+            uint8_t* p = &client->write_buf[client->write_len];
+            for (int i = 0; i < server->cursor_w * server->cursor_h; i++) {
+                convert_pixel(server->cursor_pixels[i], p, &client->fmt);
+                p += bpp;
+            }
+            client->write_len += (size_t)server->cursor_w * server->cursor_h * bpp;
+            
+            // Compute and write mask
+            uint8_t* mask = &client->write_buf[client->write_len];
+            memset(mask, 0, (size_t)server->cursor_h * mask_bytes_per_row);
+            for (int y = 0; y < server->cursor_h; y++) {
+                uint8_t* row_mask = mask + y * mask_bytes_per_row;
+                for (int x = 0; x < server->cursor_w; x++) {
+                    uint32_t pixel = server->cursor_pixels[y * server->cursor_w + x];
+                    uint8_t alpha = (uint8_t)(pixel >> 24);
+                    if (alpha > 0) {
+                        row_mask[x / 8] |= (1 << (7 - (x % 8)));
+                    }
+                }
+            }
+            client->write_len += (size_t)server->cursor_h * mask_bytes_per_row;
+            client->send_cursor_update = 0;
+            
+            vnc_client_flush(client);
+            
+            if (client->write_len > client->write_pos) {
+                return;
+            }
+            client->write_len = 0;
+            client->write_pos = 0;
+        }
+    }
+
+    int req_start_col = client->req_x / 16;
+    int req_end_col = (client->req_x + client->req_w - 1) / 16;
+    int req_start_row = client->req_y / 16;
+    int req_end_row = (client->req_y + client->req_h - 1) / 16;
+
+    if (req_start_col < 0) req_start_col = 0;
+    if (req_end_col >= server->cols) req_end_col = server->cols - 1;
+    if (req_start_row < 0) req_start_row = 0;
+    if (req_end_row >= server->rows) req_end_row = server->rows - 1;
+
+    if (!client->update_incremental) {
+        for (int r = req_start_row; r <= req_end_row; r++) {
+            for (int c = req_start_col; c <= req_end_col; c++) {
+                client->dirty_tiles[r * server->cols + c] = 1;
+            }
+        }
+        client->update_incremental = 1;
+    }
+
+    typedef struct {
+        uint16_t x, y, w, h;
+    } rect_t;
+    rect_t update_rects[4096];
+    int rect_count = 0;
+
+    for (int r = req_start_row; r <= req_end_row; r++) {
+        int c = req_start_col;
+        while (c <= req_end_col) {
+            if (client->dirty_tiles[r * server->cols + c]) {
+                int start_c = c;
+                while (c <= req_end_col && client->dirty_tiles[r * server->cols + c]) {
+                    c++;
+                }
+                int count = c - start_c;
+
+                uint16_t rx = start_c * 16;
+                uint16_t ry = r * 16;
+                uint16_t rw = count * 16;
+                uint16_t rh = 16;
+
+                if (rx < client->req_x) {
+                    rw -= (client->req_x - rx);
+                    rx = client->req_x;
+                }
+                if (rx + rw > client->req_x + client->req_w) {
+                    rw = (client->req_x + client->req_w) - rx;
+                }
+                if (ry < client->req_y) {
+                    rh -= (client->req_y - ry);
+                    ry = client->req_y;
+                }
+                if (ry + rh > client->req_y + client->req_h) {
+                    rh = (client->req_y + client->req_h) - ry;
+                }
+
+                if (rx + rw > server->width) rw = server->width - rx;
+                if (ry + rh > server->height) rh = server->height - ry;
+
+                if (rw > 0 && rh > 0) {
+                    update_rects[rect_count++] = (rect_t){rx, ry, rw, rh};
+                    if (rect_count >= 4096) break;
+                }
+            } else {
+                c++;
+            }
+        }
+        if (rect_count >= 4096) break;
+    }
+
+    if (rect_count == 0) {
+        // Keep update_requested = 1 so we retry when the framebuffer changes
+        return;
+    }
+
+    // Batch all headers and pixel data into the write buffer; flush once at the end.
+    // Using client_buf_append avoids a send() syscall for every rect header.
+    uint8_t header[4];
+    header[0] = 0;
+    header[1] = 0;
+    write_u16_be(header + 2, (uint16_t)rect_count);
+    if (client_buf_append(client, header, 4) < 0) return;
+
+    for (int i = 0; i < rect_count; i++) {
+        rect_t rect = update_rects[i];
+
+        uint8_t r_header[12];
+        write_u16_be(r_header + 0, rect.x);
+        write_u16_be(r_header + 2, rect.y);
+        write_u16_be(r_header + 4, rect.w);
+        write_u16_be(r_header + 6, rect.h);
+
+        int encoding = 0; // Raw
+        if (client->supports_tight) {
+            encoding = 7; // Tight (JPEG)
+        } else if (client->supports_hextile) {
+            encoding = 5; // Hextile
+        }
+        write_u32_be(r_header + 8, (uint32_t)encoding);
+
+        if (client_buf_append(client, r_header, 12) < 0) return;
+
+        if (encoding == 7) {
+            uint8_t* jpeg_buf = NULL;
+            unsigned long jpeg_size = 0;
+            const uint32_t* src = &server->framebuffer[rect.y * server->width + rect.x];
+
+            if (compress_jpeg(src, rect.w, rect.h, server->width, &jpeg_buf, &jpeg_size, 80) < 0) {
+                return;
+            }
+
+            if (client_ensure_write_space(client, 1 + 3 + jpeg_size) < 0) {
+                free(jpeg_buf);
+                return;
+            }
+
+            // Tight JPEG compression-control byte (0x90)
+            client->write_buf[client->write_len++] = 0x90;
+
+            // Compact representation of JPEG size
+            if (jpeg_size < 128) {
+                client->write_buf[client->write_len++] = (uint8_t)jpeg_size;
+            } else if (jpeg_size < 16384) {
+                client->write_buf[client->write_len++] = (uint8_t)((jpeg_size & 0x7F) | 0x80);
+                client->write_buf[client->write_len++] = (uint8_t)((jpeg_size >> 7) & 0x7F);
+            } else {
+                client->write_buf[client->write_len++] = (uint8_t)((jpeg_size & 0x7F) | 0x80);
+                client->write_buf[client->write_len++] = (uint8_t)(((jpeg_size >> 7) & 0x7F) | 0x80);
+                client->write_buf[client->write_len++] = (uint8_t)((jpeg_size >> 14) & 0xFF);
+            }
+
+            memcpy(&client->write_buf[client->write_len], jpeg_buf, jpeg_size);
+            client->write_len += jpeg_size;
+
+            free(jpeg_buf);
+        } else if (encoding == 5) {
+            if (vnc_encode_hextile(client, server->framebuffer, server->width, server->height, rect.x, rect.y, rect.w, rect.h) < 0) {
+                return;
+            }
+        } else {
+            // Raw encoding: pre-ensure space for the entire rect before the row loop
+            // to avoid repeated capacity checks and potential reallocs per row.
+            int bpp = get_pixel_size(&client->fmt, client->format_custom);
+            size_t rect_bytes = (size_t)rect.w * (size_t)rect.h * (size_t)bpp;
+            if (client_ensure_write_space(client, rect_bytes) < 0) return;
+
+            for (int y = 0; y < rect.h; y++) {
+                const uint32_t* src_ptr = &server->framebuffer[(rect.y + y) * server->width + rect.x];
+                uint8_t* p = &client->write_buf[client->write_len];
+                if (!client->format_custom) {
+                    memcpy(p, src_ptr, (size_t)rect.w * 4);
+                    client->write_len += (size_t)rect.w * 4;
+                } else {
+                    for (int x = 0; x < rect.w; x++) {
+                        convert_pixel(src_ptr[x], p, &client->fmt);
+                        p += bpp;
+                    }
+                    client->write_len += (size_t)rect.w * (size_t)bpp;
+                }
+            }
+        }
+
+        // Clear dirty flags for this rect using memset per tile-row (faster than nested loop)
+        int start_c = rect.x / 16;
+        int end_c   = (rect.x + rect.w - 1) / 16;
+        int start_r = rect.y / 16;
+        int end_r   = (rect.y + rect.h - 1) / 16;
+        for (int r = start_r; r <= end_r; r++) {
+            memset(&client->dirty_tiles[r * server->cols + start_c], 0,
+                   (size_t)(end_c - start_c + 1));
+        }
+    }
+
+    client->update_requested = 0;
+
+    // Flush the entire frame update in one go (minimizes send() syscalls)
+    vnc_client_flush(client);
+}
+
+void vnc_server_set_cursor(vnc_server_t* server, const uint32_t* pixels, uint16_t w, uint16_t h, uint16_t xhot, uint16_t yhot) {
+    if (!server) return;
+
+    free(server->cursor_pixels);
+    server->cursor_pixels = NULL;
+    server->cursor_w = w;
+    server->cursor_h = h;
+    server->cursor_xhot = xhot;
+    server->cursor_yhot = yhot;
+
+    if (w > 0 && h > 0 && pixels) {
+        server->cursor_pixels = (uint32_t*)malloc((size_t)w * h * sizeof(uint32_t));
+        if (server->cursor_pixels) {
+            memcpy(server->cursor_pixels, pixels, (size_t)w * h * sizeof(uint32_t));
+        }
+    }
+
+    // Notify all connected clients that support RichCursor to download the new cursor shape
+    vnc_client_t* client = server->clients;
+    while (client) {
+        client->send_cursor_update = 1;
+        client = client->next;
+    }
+}
+
+int vnc_server_has_clients(const vnc_server_t* server) {
+    return server && server->clients != NULL;
+}
