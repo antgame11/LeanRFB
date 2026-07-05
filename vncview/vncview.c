@@ -116,6 +116,23 @@ static AVCodecContext* codec_ctx = NULL;
 static AVFrame* frame = NULL;
 static AVPacket* pkt = NULL;
 static struct SwsContext* sws_ctx = NULL;
+static AVBufferRef* hw_device_ctx = NULL;
+static AVFrame* sw_frame = NULL;
+static enum AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
+static enum AVPixelFormat last_format = AV_PIX_FMT_NONE;
+
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+    (void)ctx;
+    const enum AVPixelFormat *p;
+    for (p = pix_fmts; *p != -1; p++) {
+        if (*p == AV_PIX_FMT_VAAPI || *p == AV_PIX_FMT_CUDA) {
+            hw_pix_fmt = *p;
+            return *p;
+        }
+    }
+    fprintf(stderr, "Failed to get HW surface format.\n");
+    return AV_PIX_FMT_NONE;
+}
 
 static void init_decoder(int width, int height) {
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
@@ -133,6 +150,24 @@ static void init_decoder(int width, int height) {
     codec_ctx->thread_count = 0;
     codec_ctx->thread_type = FF_THREAD_SLICE;
 
+    // Attempt to initialize GPU VA-API (Intel/AMD)
+    int ret = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0);
+    if (ret >= 0) {
+        codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+        codec_ctx->get_format = get_hw_format;
+        printf("[VNCVIEW] GPU VA-API Hardware Decoding enabled successfully.\n");
+    } else {
+        // Try GPU CUDA (Nvidia)
+        ret = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0);
+        if (ret >= 0) {
+            codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+            codec_ctx->get_format = get_hw_format;
+            printf("[VNCVIEW] GPU CUDA Hardware Decoding enabled successfully.\n");
+        } else {
+            printf("[VNCVIEW] GPU Hardware Decoding not supported. Falling back to CPU software decoding.\n");
+        }
+    }
+
     AVDictionary* opts = NULL;
     av_dict_set(&opts, "tune", "zerolatency", 0);
     
@@ -143,6 +178,8 @@ static void init_decoder(int width, int height) {
 
     frame = av_frame_alloc();
     pkt = av_packet_alloc();
+    sw_frame = av_frame_alloc();
+    last_format = AV_PIX_FMT_NONE;
 }
 
 static void reset_decoder(int width, int height) {
@@ -158,10 +195,20 @@ static void reset_decoder(int width, int height) {
         av_packet_free(&pkt);
         pkt = NULL;
     }
+    if (sw_frame) {
+        av_frame_free(&sw_frame);
+        sw_frame = NULL;
+    }
+    if (hw_device_ctx) {
+        av_buffer_unref(&hw_device_ctx);
+        hw_device_ctx = NULL;
+    }
     if (sws_ctx) {
         sws_freeContext(sws_ctx);
         sws_ctx = NULL;
     }
+    hw_pix_fmt = AV_PIX_FMT_NONE;
+    last_format = AV_PIX_FMT_NONE;
     init_decoder(width, height);
 }
 
@@ -179,17 +226,30 @@ static int decode_h264(const uint8_t* data, int len, uint8_t* out_bgra, int widt
         return -1;
     }
 
-    if (!sws_ctx) {
-        sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+    AVFrame* src_frame = frame;
+    if (frame->format == hw_pix_fmt && hw_pix_fmt != AV_PIX_FMT_NONE) {
+        av_frame_unref(sw_frame);
+        int err = av_hwframe_transfer_data(sw_frame, frame, 0);
+        if (err >= 0) {
+            src_frame = sw_frame;
+        }
+    }
+
+    if (!sws_ctx || last_format != src_frame->format) {
+        if (sws_ctx) {
+            sws_freeContext(sws_ctx);
+        }
+        sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, src_frame->format,
                                  width, height, AV_PIX_FMT_BGRA,
                                  SWS_BILINEAR, NULL, NULL, NULL);
+        last_format = src_frame->format;
     }
 
     uint8_t* dest[4] = { out_bgra, NULL, NULL, NULL };
     int dest_linesize[4] = { width * 4, 0, 0, 0 };
 
     pthread_mutex_lock(&backbuffer_mutex);
-    sws_scale(sws_ctx, (const uint8_t *const *)frame->data, frame->linesize, 0, codec_ctx->height,
+    sws_scale(sws_ctx, (const uint8_t *const *)src_frame->data, src_frame->linesize, 0, codec_ctx->height,
               dest, dest_linesize);
     pthread_mutex_unlock(&backbuffer_mutex);
 
@@ -594,10 +654,20 @@ static void on_viewer_destroy(void) {
         av_packet_free(&pkt);
         pkt = NULL;
     }
+    if (sw_frame) {
+        av_frame_free(&sw_frame);
+        sw_frame = NULL;
+    }
+    if (hw_device_ctx) {
+        av_buffer_unref(&hw_device_ctx);
+        hw_device_ctx = NULL;
+    }
     if (sws_ctx) {
         sws_freeContext(sws_ctx);
         sws_ctx = NULL;
     }
+    hw_pix_fmt = AV_PIX_FMT_NONE;
+    last_format = AV_PIX_FMT_NONE;
     viewer_window = NULL;
     gtk_widget_show_all(main_window);
 }
