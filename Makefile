@@ -1,12 +1,13 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -Werror -O3 -g -std=c99 -Iinclude
-LDFLAGS = -L. -lleanrfb -ljpeg -lcrypto
+LDFLAGS = -L. -lleanrfb -ljpeg -lcrypto -lx264
 X11_LDFLAGS = -lX11 -lXext -lXtst -lXfixes
+CLIENT_LDFLAGS = -lavcodec -lswscale -lavutil -lX11 -lcrypto
 
-LIB_OBJS = src/leanrfb.o src/leanrfb_hextile.o src/leanrfb_jpeg.o
+LIB_OBJS = src/leanrfb.o src/leanrfb_hextile.o src/leanrfb_jpeg.o src/leanrfb_h264.o
 LIB_NAME = libleanrfb.a
 
-all: $(LIB_NAME) demo_server x11_vnc_server
+all: $(LIB_NAME) demo_server x11_vnc_server vncviewer
 
 $(LIB_NAME): $(LIB_OBJS)
 	ar rcs $@ $^
@@ -26,7 +27,13 @@ x11_vnc_server: x11_vnc/x11_vnc_server.o $(LIB_NAME)
 x11_vnc/x11_vnc_server.o: x11_vnc/x11_vnc_server.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+vncviewer: vncview/vncview.o
+	$(CC) -o $@ vncview/vncview.o $(CLIENT_LDFLAGS)
+
+vncview/vncview.o: vncview/vncview.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 clean:
-	rm -f src/*.o examples/*.o x11_vnc/*.o $(LIB_NAME) demo_server x11_vnc_server
+	rm -f src/*.o examples/*.o x11_vnc/*.o vncview/*.o $(LIB_NAME) demo_server x11_vnc_server vncviewer
 
 .PHONY: all clean

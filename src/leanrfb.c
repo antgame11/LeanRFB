@@ -734,6 +734,9 @@ static void vnc_client_disconnect(vnc_server_t* server, vnc_client_t* client) {
     if (client->fd >= 0) {
         close(client->fd);
     }
+    if (client->h264_enc) {
+        vnc_h264_encoder_destroy(client->h264_enc);
+    }
     free(client->dirty_tiles);
     free(client);
 }
@@ -1047,6 +1050,7 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                 client->supports_hextile = 0;
                 client->supports_tight = 0;
                 client->supports_rich_cursor = 0;
+                client->supports_h264 = 0;
                 printf("[VNC SERVER] Client supports encodings: ");
                 for (int i = 0; i < num_encodings; i++) {
                     int32_t enc = (int32_t)read_u32_be(p + 4 + i * 4);
@@ -1055,6 +1059,8 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                         client->supports_hextile = 1;
                     } else if (enc == 7) {
                         client->supports_tight = 1;
+                    } else if (enc == 50) {
+                        client->supports_h264 = 1;
                     } else if (enc == -239) {
                         client->supports_rich_cursor = 1;
                     }
@@ -1183,6 +1189,60 @@ static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client) {
             client->write_len = 0;
             client->write_pos = 0;
         }
+    }
+
+    if (client->supports_h264) {
+        int has_dirty = 0;
+        for (int i = 0; i < server->cols * server->rows; i++) {
+            if (client->dirty_tiles[i]) {
+                has_dirty = 1;
+                break;
+            }
+        }
+        if (!has_dirty) {
+            return;
+        }
+
+        if (!client->h264_enc) {
+            client->h264_enc = vnc_h264_encoder_create(server->width, server->height, 30, 80);
+            if (!client->h264_enc) return;
+        }
+
+        uint8_t* h264_data = NULL;
+        int h264_len = 0;
+        int is_key = 0;
+        int pts = 0;
+        if (vnc_h264_encoder_encode(client->h264_enc, server->framebuffer, &h264_data, &h264_len, &is_key, &pts) == 0 && h264_len > 0) {
+            uint8_t header[4];
+            header[0] = 0;
+            header[1] = 0;
+            write_u16_be(header + 2, 1);
+            if (client_buf_append(client, header, 4) < 0) return;
+
+            uint8_t r_header[12];
+            write_u16_be(r_header + 0, 0);
+            write_u16_be(r_header + 2, 0);
+            write_u16_be(r_header + 4, server->width);
+            write_u16_be(r_header + 6, server->height);
+            write_u32_be(r_header + 8, 50);
+            if (client_buf_append(client, r_header, 12) < 0) return;
+
+            uint8_t p_header[8];
+            write_u32_be(p_header + 0, (uint32_t)h264_len);
+            uint32_t flags = 0;
+            if (is_key && pts == 1) {
+                flags = 2;
+            }
+            write_u32_be(p_header + 4, flags);
+
+            if (client_buf_append(client, p_header, 8) < 0) return;
+            if (client_buf_append(client, h264_data, h264_len) < 0) return;
+
+            memset(client->dirty_tiles, 0, (size_t)server->cols * server->rows);
+            client->update_requested = 0;
+            vnc_client_flush(client);
+        }
+        return;
     }
 
     int req_start_col = client->req_x / 16;

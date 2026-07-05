@@ -65,6 +65,8 @@ struct vnc_client {
   int supports_tight;
   int supports_rich_cursor;
   int send_cursor_update;
+  int supports_h264;
+  void *h264_enc;
 
   // Output buffering
   uint8_t *write_buf;
@@ -232,5 +234,10 @@ int compress_jpeg(const uint32_t *src, int w, int h, int stride,
 int vnc_encode_hextile(vnc_client_t *client, const uint32_t *fb, int fb_width,
                        int fb_height, uint16_t rx, uint16_t ry, uint16_t rw,
                        uint16_t rh);
+
+// H.264 encoder interface
+void* vnc_h264_encoder_create(int width, int height, int fps, int quality);
+int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_data, int* out_len, int* is_keyframe, int* pts_out);
+void vnc_h264_encoder_destroy(void* enc_ptr);
 
 #endif // LEANRFB_INTERNAL_H
