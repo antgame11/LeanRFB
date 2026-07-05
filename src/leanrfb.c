@@ -540,41 +540,31 @@ int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
 void vnc_server_update_framebuffer(vnc_server_t* server, const uint32_t* fb_data) {
     if (!server || !fb_data) return;
 
-    for (int r = 0; r < server->rows; r++) {
-        int ty = r * 16;
-        int th = (server->height - ty < 16) ? (server->height - ty) : 16;
+    for (int y = 0; y < server->height; y++) {
+        size_t row_offset = y * (size_t)server->width;
+        size_t row_bytes = (size_t)server->width * 4;
 
-        for (int c = 0; c < server->cols; c++) {
-            int tx = c * 16;
-            int tw = (server->width - tx < 16) ? (server->width - tx) : 16;
-            size_t row_bytes = (size_t)tw * 4;
+        if (memcmp(&server->framebuffer[row_offset], &fb_data[row_offset], row_bytes) != 0) {
+            // Find which tiles are affected by changes in this row
+            int r = y / 16;
+            for (int c = 0; c < server->cols; c++) {
+                int tile_idx = r * server->cols + c;
+                int tx = c * 16;
+                int tw = (server->width - tx < 16) ? (server->width - tx) : 16;
 
-            // Phase 1: compare rows until we find a difference
-            int changed = 0;
-            int y = 0;
-            for (; y < th; y++) {
-                size_t offset = (ty + y) * (size_t)server->width + tx;
-                if (memcmp(&server->framebuffer[offset], &fb_data[offset], row_bytes) != 0) {
-                    memcpy(&server->framebuffer[offset], &fb_data[offset], row_bytes);
-                    changed = 1;
-                    y++;
-                    break; // switch to copy-only mode for remaining rows
+                if (!server->server_dirty[tile_idx]) {
+                    if (memcmp(&server->framebuffer[row_offset + tx], &fb_data[row_offset + tx], (size_t)tw * 4) != 0) {
+                        server->server_dirty[tile_idx] = 1;
+                        vnc_client_t* cl = server->clients;
+                        while (cl) {
+                            cl->dirty_tiles[tile_idx] = 1;
+                            cl = cl->next;
+                        }
+                    }
                 }
             }
-            // Phase 2: once changed, just copy remaining rows without comparing
-            for (; y < th; y++) {
-                size_t offset = (ty + y) * (size_t)server->width + tx;
-                memcpy(&server->framebuffer[offset], &fb_data[offset], row_bytes);
-            }
-
-            if (changed) {
-                server->server_dirty[r * server->cols + c] = 1;
-                vnc_client_t* cl = server->clients;
-                while (cl) {
-                    cl->dirty_tiles[r * server->cols + c] = 1;
-                    cl = cl->next;
-                }
-            }
+            // Now copy the whole scanline
+            memcpy(&server->framebuffer[row_offset], &fb_data[row_offset], row_bytes);
         }
     }
 }
@@ -1261,6 +1251,37 @@ static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client) {
         }
         if (rect_count >= 4096) break;
     }
+
+    // Vertical coalescing pass
+    int merged = 1;
+    while (merged) {
+        merged = 0;
+        for (int i = 0; i < rect_count; i++) {
+            if (update_rects[i].h == 0) continue;
+            for (int j = i + 1; j < rect_count; j++) {
+                if (update_rects[j].h == 0) continue;
+                if (update_rects[i].x == update_rects[j].x &&
+                    update_rects[i].w == update_rects[j].w &&
+                    update_rects[i].y + update_rects[i].h == update_rects[j].y) {
+                    update_rects[i].h += update_rects[j].h;
+                    update_rects[j].h = 0;
+                    merged = 1;
+                }
+            }
+        }
+    }
+
+    // Pack active rectangles
+    int active_rects = 0;
+    for (int i = 0; i < rect_count; i++) {
+        if (update_rects[i].h > 0) {
+            if (i != active_rects) {
+                update_rects[active_rects] = update_rects[i];
+            }
+            active_rects++;
+        }
+    }
+    rect_count = active_rects;
 
     if (rect_count == 0) {
         // Keep update_requested = 1 so we retry when the framebuffer changes
