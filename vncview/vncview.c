@@ -59,6 +59,11 @@ static inline uint32_t read_u32_be(const uint8_t *buf) {
 #define VNC_UDP_MAX_FRAGS 512
 #define VNC_UDP_MAX_DATAGRAM (VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN + VNC_UDP_INNER_HDR_LEN + VNC_UDP_MAX_FRAG_PAYLOAD)
 #define VNC_UDP_HEARTBEAT_INTERVAL_MS 2000
+// If a frame's fragments stop arriving (loss/reordering with no recovery), abandon it after
+// this long rather than waiting forever — otherwise the client would never send its next
+// FramebufferUpdateRequest (that only happens after a frame is decoded+drawn) and the whole
+// exchange would deadlock permanently on a single dropped datagram.
+#define VNC_UDP_REASM_TIMEOUT_MS 400
 #define VNC_UDP_SETUP_PAYLOAD_LEN (2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN)
 #define VNC_MSG_REQUEST_KEYFRAME 254
 
@@ -260,6 +265,7 @@ static udp_replay_state_t udp_recv_replay;
 static volatile int udp_active = 0;
 static unsigned long long udp_last_heartbeat_ms = 0;
 static unsigned long long udp_last_keyframe_request_ms = 0;
+static unsigned long long reasm_start_ms = 0;
 
 // UDP frame reassembly state (single in-flight frame; stale/incomplete frames are dropped
 // rather than blocking, since low latency matters more than never losing a frame here)
@@ -701,6 +707,14 @@ static void udp_handle_setup(const uint8_t* payload) {
 
     if (udp_fd < 0) {
         udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_fd >= 0) {
+            // A generous receive buffer reduces the odds of the kernel dropping fragments
+            // during a burst (e.g. a keyframe's worth of datagrams arriving back-to-back)
+            // if this thread is briefly descheduled; see VNC_UDP_REASM_TIMEOUT_MS for the
+            // self-healing fallback when a fragment is lost anyway.
+            int rcvbuf = 4 * 1024 * 1024;
+            setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        }
     }
     memset(&udp_server_addr, 0, sizeof(udp_server_addr));
     udp_server_addr.sin_family = AF_INET;
@@ -732,6 +746,7 @@ static void reasm_start(uint32_t frame_id, uint16_t frag_count) {
     reasm_frag_count = frag_count;
     reasm_frags_got = 0;
     reasm_last_frag_len = 0;
+    reasm_start_ms = vv_now_ms();
     reasm_active = 1;
 }
 
@@ -816,6 +831,22 @@ static void udp_drain(void) {
     }
 }
 
+// Give up on a frame whose fragments stopped arriving. Without this, a single dropped
+// UDP datagram would stall the reassembler forever — and since the client only sends its
+// next FramebufferUpdateRequest after decoding+drawing a frame (see on_draw), the server
+// would then have nothing left to prompt it to keep sending. Abandoning the frame, asking
+// for a keyframe, and re-arming the request ourselves keeps the stream self-healing.
+static void reasm_check_timeout(void) {
+    if (!reasm_active) return;
+    if (vv_now_ms() - reasm_start_ms < VNC_UDP_REASM_TIMEOUT_MS) return;
+
+    reasm_active = 0;
+    request_keyframe();
+    if (vnc_fd >= 0) {
+        send_fb_request(vnc_fd, 1, 0, 0, screen_w, screen_h);
+    }
+}
+
 // Background network client loop thread (after handshake is complete)
 static void* vnc_client_thread(void* arg) {
     (void)arg;
@@ -858,7 +889,9 @@ static void* vnc_client_thread(void* arg) {
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
 
-        int pr = poll(pfds, 2, 1000); // wake at least once/sec to service the UDP heartbeat
+        // Bounded wait (rather than blocking indefinitely) so the heartbeat and stuck-frame
+        // reassembly timeout are both serviced promptly even when idle.
+        int pr = poll(pfds, 2, 200);
         if (pr < 0) {
             if (errno == EINTR) continue;
             break;
@@ -870,6 +903,10 @@ static void* vnc_client_thread(void* arg) {
 
         if (pfds[1].revents & POLLIN) {
             udp_drain();
+        }
+
+        if (udp_active) {
+            reasm_check_timeout();
         }
 
         if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) break;

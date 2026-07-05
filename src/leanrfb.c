@@ -312,6 +312,10 @@ vnc_server_t* vnc_server_create(const vnc_server_config_t* config) {
         if (udp_fd >= 0) {
             int udp_reuse = 1;
             setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &udp_reuse, sizeof(udp_reuse));
+            // A generous receive buffer absorbs bursts of client Hello/heartbeat datagrams
+            // (e.g. several clients reconnecting at once) without the kernel dropping them.
+            int rcvbuf = 4 * 1024 * 1024;
+            setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
             if (bind(udp_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
                 set_nonblocking(udp_fd) < 0) {
                 close(udp_fd);
