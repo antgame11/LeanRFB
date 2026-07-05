@@ -16,6 +16,7 @@ typedef struct {
     int height;
     int pts;
     int is_hw; // 1 = VA-API, 2 = NVENC, 0 = Software x264
+    int force_keyframe; // set by vnc_h264_encoder_force_keyframe(), consumed on next encode
 } vnc_h264_encoder_t;
 
 // Color space conversion helper functions (fast integer logic)
@@ -224,6 +225,10 @@ int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_dat
     if (pts_out) {
         *pts_out = (int)send_frame->pts;
     }
+    if (enc->force_keyframe) {
+        send_frame->pict_type = AV_PICTURE_TYPE_I;
+        enc->force_keyframe = 0;
+    }
 
     int ret = avcodec_send_frame(enc->codec_ctx, send_frame);
     if (ret < 0) return -1;
@@ -243,6 +248,11 @@ int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_dat
     *out_len = enc->pkt->size;
     *is_keyframe = (enc->pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
     return 0;
+}
+
+void vnc_h264_encoder_force_keyframe(void* enc_ptr) {
+    vnc_h264_encoder_t* enc = (vnc_h264_encoder_t*)enc_ptr;
+    if (enc) enc->force_keyframe = 1;
 }
 
 void vnc_h264_encoder_destroy(void* enc_ptr) {

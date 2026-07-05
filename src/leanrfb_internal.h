@@ -46,6 +46,33 @@ typedef struct {
 // Max accepted ClientCutText payload — must be <= VNC_READ_BUF_SIZE - 8
 #define VNC_CLIPBOARD_MAX_LEN (VNC_READ_BUF_SIZE - 8)
 
+// --- UDP H.264 transport (see docs/custom/rfb_h264_udp_extension.md) ---
+// Pseudo-encoding used to negotiate + set up the UDP side-channel.
+#define VNC_ENCODING_UDP_SETUP 51
+
+// Datagram type byte (also doubles as the AEAD nonce direction discriminator,
+// so the two directions never share nonce space under the same session key).
+#define VNC_UDP_TYPE_VIDEO 0  // server -> client, fragmented H.264 payload
+#define VNC_UDP_TYPE_HELLO 1  // client -> server, hole-punch / liveness heartbeat
+
+#define VNC_UDP_KEY_LEN 32   // AES-256-GCM key
+#define VNC_UDP_CID_LEN 8    // per-session connection id
+#define VNC_UDP_TAG_LEN 16   // GCM authentication tag
+#define VNC_UDP_HDR_LEN (1 + VNC_UDP_CID_LEN + 8) // type + cid + 64-bit counter
+#define VNC_UDP_INNER_HDR_LEN 10 // frame_id(4) frag_idx(2) frag_count(2) flags(1) reserved(1)
+#define VNC_UDP_MAX_FRAG_PAYLOAD 1200
+#define VNC_UDP_MAX_FRAGS 512
+#define VNC_UDP_MAX_DATAGRAM (VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN + VNC_UDP_INNER_HDR_LEN + VNC_UDP_MAX_FRAG_PAYLOAD)
+
+#define VNC_UDP_LIVENESS_TIMEOUT_MS 8000  // no heartbeat/hello within this window -> fall back to TCP
+#define VNC_UDP_HEARTBEAT_INTERVAL_MS 2000
+
+// Sliding replay window (64 packets) for anti-replay protection of one direction.
+typedef struct {
+  uint64_t highest;
+  uint64_t bitmap;
+} vnc_udp_replay_state_t;
+
 // Blocked-IP entry for brute-force protection
 typedef struct {
   char ip[INET_ADDRSTRLEN];
@@ -67,6 +94,20 @@ struct vnc_client {
   int send_cursor_update;
   int supports_h264;
   void *h264_enc;
+  int force_keyframe_requested; // set when client asks the encoder to emit a fresh IDR
+
+  // UDP H.264 transport (see docs/custom/rfb_h264_udp_extension.md)
+  int supports_udp;          // client advertised VNC_ENCODING_UDP_SETUP
+  int udp_setup_sent;        // 1 once the one-time setup message has been sent over TCP
+  int udp_ready;             // 1 once a valid Hello has been received from this client
+  uint8_t udp_key[VNC_UDP_KEY_LEN];
+  uint8_t udp_cid[VNC_UDP_CID_LEN];
+  struct sockaddr_storage udp_addr;
+  socklen_t udp_addr_len;
+  uint64_t udp_send_ctr;      // monotonic counter for VNC_UDP_TYPE_VIDEO packets
+  uint32_t udp_frame_id;      // monotonic frame id, one per encoded frame sent over UDP
+  vnc_udp_replay_state_t udp_recv_replay; // anti-replay state for Hello/heartbeat packets
+  unsigned long long udp_last_recv_ms;    // last time a valid Hello/heartbeat arrived
 
   // Output buffering
   uint8_t *write_buf;
@@ -148,6 +189,10 @@ struct vnc_server {
   int pfds_cap;
 
   int websocket;
+
+  // UDP H.264 transport
+  int udp_fd;          // datagram socket bound to the same port number as listen_fd, or -1 if disabled
+  int disable_udp_h264; // mirrors config->disable_udp_h264
 };
 
 // Byte-order conversion helper functions
@@ -239,5 +284,36 @@ int vnc_encode_hextile(vnc_client_t *client, const uint32_t *fb, int fb_width,
 void* vnc_h264_encoder_create(int width, int height, int fps, int quality);
 int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_data, int* out_len, int* is_keyframe, int* pts_out);
 void vnc_h264_encoder_destroy(void* enc_ptr);
+// Force the next encoded frame to be a fresh IDR keyframe (used to recover from UDP packet loss).
+void vnc_h264_encoder_force_keyframe(void* enc_ptr);
+
+// --- UDP H.264 transport interface (src/leanrfb_udp.c) ---
+
+// AEAD-seal a plaintext payload into a self-contained UDP datagram.
+// out must have room for at least VNC_UDP_HDR_LEN + pt_len + VNC_UDP_TAG_LEN bytes.
+// Returns the total datagram length, or -1 on failure.
+int vnc_udp_seal(const uint8_t key[VNC_UDP_KEY_LEN], uint8_t type,
+                 const uint8_t cid[VNC_UDP_CID_LEN], uint64_t counter,
+                 const uint8_t* pt, int pt_len, uint8_t* out, int out_cap);
+
+// Authenticate and decrypt a received UDP datagram.
+// pt_out must have room for at least in_len bytes.
+// Returns 0 on success (out_type/out_cid/out_counter/pt_out/pt_len_out populated), -1 on failure.
+int vnc_udp_open(const uint8_t key[VNC_UDP_KEY_LEN], const uint8_t* in, int in_len,
+                 uint8_t* out_type, uint8_t out_cid[VNC_UDP_CID_LEN], uint64_t* out_counter,
+                 uint8_t* pt_out, int* pt_len_out);
+
+// Anti-replay sliding window check. Returns 1 if counter is fresh (and records it), 0 if it
+// is a replay or too old to accept.
+int vnc_udp_replay_check(vnc_udp_replay_state_t* st, uint64_t counter);
+
+// Fragment, encrypt and send one encoded H.264 frame to a client over UDP.
+// Returns 0 on success, -1 on failure (caller should fall back to TCP for this frame).
+int vnc_udp_send_video_frame(vnc_server_t* server, vnc_client_t* client,
+                             const uint8_t* data, int len, int flags);
+
+// Drain and process all pending datagrams on server->udp_fd (Hello/heartbeat handling).
+// Bounded so a single call cannot monopolize the poll loop under flood conditions.
+void vnc_udp_handle_incoming(vnc_server_t* server);
 
 #endif // LEANRFB_INTERNAL_H

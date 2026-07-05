@@ -5,7 +5,7 @@ X11_LDFLAGS = -lX11 -lXext -lXtst -lXfixes
 CLIENT_CFLAGS = $(shell pkg-config --cflags gtk+-3.0)
 CLIENT_LDFLAGS = $(shell pkg-config --libs gtk+-3.0) -lavcodec -lswscale -lavutil -ljpeg -lcrypto -lpthread
 
-LIB_OBJS = src/leanrfb.o src/leanrfb_hextile.o src/leanrfb_jpeg.o src/leanrfb_h264.o
+LIB_OBJS = src/leanrfb.o src/leanrfb_hextile.o src/leanrfb_jpeg.o src/leanrfb_h264.o src/leanrfb_udp.o
 LIB_NAME = libleanrfb.a
 
 all: $(LIB_NAME) demo_server x11_vnc_server vncviewer

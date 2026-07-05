@@ -26,6 +26,9 @@ typedef struct vnc_server_config {
     const char* password;      // Authentication password (NULL/empty for no authentication)
     int max_clients;           // Maximum simultaneous clients (0 = use default of 16)
     int websocket;             // 1 to enable WebSocket/HTTP mode on the same port
+    int disable_udp_h264;      // 1 to disable the encrypted UDP transport for H.264 video
+                               // (server falls back to TCP-only H.264 delivery). See
+                               // docs/custom/rfb_h264_udp_extension.md for details.
 
     vnc_key_event_cb on_key;   // Key event callback
     vnc_pointer_event_cb on_pointer; // Pointer event callback

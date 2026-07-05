@@ -14,10 +14,12 @@
 #include <gtk/gtk.h>
 #include <gdk/gdkkeysyms.h>
 #include <openssl/des.h>
+#include <openssl/evp.h>
 #include <jpeglib.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
+#include <time.h>
 
 // Standard VNC macros
 #define write_u16_be(buf, val) do { \
@@ -39,6 +41,142 @@ static inline uint16_t read_u16_be(const uint8_t *buf) {
 static inline uint32_t read_u32_be(const uint8_t *buf) {
     return ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
            ((uint32_t)buf[2] << 8) | buf[3];
+}
+
+// --- Encrypted UDP transport for H.264 (see docs/custom/rfb_h264_udp_extension.md) ---
+// Mirrors the constants and AEAD framing used by src/leanrfb_udp.c; vncview.c does not
+// link against libleanrfb, so the wire format is reimplemented here (the VNC auth DES
+// helper above is duplicated the same way).
+#define VNC_ENCODING_UDP_SETUP 51
+#define VNC_UDP_TYPE_VIDEO 0
+#define VNC_UDP_TYPE_HELLO 1
+#define VNC_UDP_KEY_LEN 32
+#define VNC_UDP_CID_LEN 8
+#define VNC_UDP_TAG_LEN 16
+#define VNC_UDP_HDR_LEN (1 + VNC_UDP_CID_LEN + 8)
+#define VNC_UDP_INNER_HDR_LEN 10
+#define VNC_UDP_MAX_FRAG_PAYLOAD 1200
+#define VNC_UDP_MAX_FRAGS 512
+#define VNC_UDP_MAX_DATAGRAM (VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN + VNC_UDP_INNER_HDR_LEN + VNC_UDP_MAX_FRAG_PAYLOAD)
+#define VNC_UDP_HEARTBEAT_INTERVAL_MS 2000
+#define VNC_UDP_SETUP_PAYLOAD_LEN (2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN)
+#define VNC_MSG_REQUEST_KEYFRAME 254
+
+typedef struct {
+    uint64_t highest;
+    uint64_t bitmap;
+} udp_replay_state_t;
+
+static unsigned long long vv_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void udp_build_nonce(uint8_t type, const uint8_t cid[VNC_UDP_CID_LEN], uint64_t counter, uint8_t nonce[12]) {
+    nonce[0] = type;
+    nonce[1] = cid[0];
+    nonce[2] = cid[1];
+    nonce[3] = cid[2];
+    for (int i = 0; i < 8; i++) {
+        nonce[4 + i] = (uint8_t)(counter >> (8 * (7 - i)));
+    }
+}
+
+static int udp_seal(const uint8_t key[VNC_UDP_KEY_LEN], uint8_t type,
+                    const uint8_t cid[VNC_UDP_CID_LEN], uint64_t counter,
+                    const uint8_t* pt, int pt_len, uint8_t* out, int out_cap) {
+    if (out_cap < VNC_UDP_HDR_LEN + pt_len + VNC_UDP_TAG_LEN) return -1;
+
+    out[0] = type;
+    memcpy(out + 1, cid, VNC_UDP_CID_LEN);
+    for (int i = 0; i < 8; i++) {
+        out[1 + VNC_UDP_CID_LEN + i] = (uint8_t)(counter >> (8 * (7 - i)));
+    }
+
+    uint8_t nonce[12];
+    udp_build_nonce(type, cid, counter, nonce);
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+
+    int ok = 1;
+    int len = 0;
+    int ciphertext_len = 0;
+    uint8_t* ciphertext = out + VNC_UDP_HDR_LEN;
+
+    if (ok && EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) ok = 0;
+    if (ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) ok = 0;
+    if (ok && EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) ok = 0;
+    if (ok && EVP_EncryptUpdate(ctx, NULL, &len, out, VNC_UDP_HDR_LEN) != 1) ok = 0;
+    if (ok && pt_len > 0 && EVP_EncryptUpdate(ctx, ciphertext, &len, pt, pt_len) != 1) ok = 0;
+    if (ok) ciphertext_len = (pt_len > 0) ? len : 0;
+    if (ok && EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &len) != 1) ok = 0;
+    if (ok) ciphertext_len += len;
+    if (ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, VNC_UDP_TAG_LEN, ciphertext + ciphertext_len) != 1) ok = 0;
+
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) return -1;
+    return VNC_UDP_HDR_LEN + ciphertext_len + VNC_UDP_TAG_LEN;
+}
+
+static int udp_open(const uint8_t key[VNC_UDP_KEY_LEN], const uint8_t* in, int in_len,
+                    uint8_t* out_type, uint64_t* out_counter, uint8_t* pt_out, int* pt_len_out) {
+    if (in_len < VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN) return -1;
+
+    uint8_t type = in[0];
+    const uint8_t* cid = in + 1;
+    uint64_t counter = 0;
+    for (int i = 0; i < 8; i++) {
+        counter = (counter << 8) | in[1 + VNC_UDP_CID_LEN + i];
+    }
+
+    int ciphertext_len = in_len - VNC_UDP_HDR_LEN - VNC_UDP_TAG_LEN;
+    const uint8_t* ciphertext = in + VNC_UDP_HDR_LEN;
+    const uint8_t* tag = in + in_len - VNC_UDP_TAG_LEN;
+
+    uint8_t nonce[12];
+    udp_build_nonce(type, cid, counter, nonce);
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+
+    int ok = 1;
+    int len = 0;
+    int plaintext_len = 0;
+
+    if (ok && EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) ok = 0;
+    if (ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) ok = 0;
+    if (ok && EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) ok = 0;
+    if (ok && EVP_DecryptUpdate(ctx, NULL, &len, in, VNC_UDP_HDR_LEN) != 1) ok = 0;
+    if (ok && ciphertext_len > 0 && EVP_DecryptUpdate(ctx, pt_out, &len, ciphertext, ciphertext_len) != 1) ok = 0;
+    if (ok) plaintext_len = (ciphertext_len > 0) ? len : 0;
+    if (ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, VNC_UDP_TAG_LEN, (void*)tag) != 1) ok = 0;
+    if (ok && EVP_DecryptFinal_ex(ctx, pt_out + plaintext_len, &len) <= 0) ok = 0;
+
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) return -1;
+
+    *out_type = type;
+    *out_counter = counter;
+    *pt_len_out = plaintext_len;
+    return 0;
+}
+
+static int udp_replay_check(udp_replay_state_t* st, uint64_t counter) {
+    if (counter > st->highest) {
+        uint64_t shift = counter - st->highest;
+        st->bitmap = (shift >= 64) ? 0 : (st->bitmap << shift);
+        st->bitmap |= 1ULL;
+        st->highest = counter;
+        return 1;
+    }
+    uint64_t diff = st->highest - counter;
+    if (diff >= 64) return 0;
+    uint64_t mask = 1ULL << diff;
+    if (st->bitmap & mask) return 0;
+    st->bitmap |= mask;
+    return 1;
 }
 
 // VNC auth helper
@@ -110,6 +248,32 @@ static volatile int client_running = 0;
 static uint8_t button_mask = 0;
 static char preferred_encoding[32] = "h264";
 static volatile int waiting_for_draw = 0;
+
+// UDP H.264 transport state (owned by vnc_client_thread; see docs/custom/rfb_h264_udp_extension.md)
+static int udp_fd = -1;
+static struct in_addr udp_server_in_addr; // set from the TCP connection's resolved address
+static struct sockaddr_in udp_server_addr;
+static uint8_t udp_key[VNC_UDP_KEY_LEN];
+static uint8_t udp_cid[VNC_UDP_CID_LEN];
+static uint64_t udp_send_ctr = 0;
+static udp_replay_state_t udp_recv_replay;
+static volatile int udp_active = 0;
+static unsigned long long udp_last_heartbeat_ms = 0;
+static unsigned long long udp_last_keyframe_request_ms = 0;
+
+// UDP frame reassembly state (single in-flight frame; stale/incomplete frames are dropped
+// rather than blocking, since low latency matters more than never losing a frame here)
+static int reasm_active = 0;
+static uint32_t reasm_frame_id = 0;
+static uint16_t reasm_frag_count = 0;
+static uint16_t reasm_frags_got = 0;
+static uint16_t reasm_last_frag_len = 0;
+static uint8_t reasm_flags = 0;
+static uint8_t* reasm_buf = NULL;
+static size_t reasm_buf_cap = 0;
+static uint8_t reasm_got_bitmap[(VNC_UDP_MAX_FRAGS + 7) / 8];
+static int have_last_completed_frame = 0;
+static uint32_t last_completed_frame_id = 0;
 
 // FFmpeg variables
 static AVCodecContext* codec_ctx = NULL;
@@ -218,6 +382,10 @@ static void reset_decoder(int width, int height) {
 }
 
 static int decode_h264(const uint8_t* data, int len, uint8_t* out_bgra, int width, int height) {
+    if (!codec_ctx) {
+        init_decoder(width, height);
+        if (!codec_ctx) return -1;
+    }
     pkt->data = (uint8_t*)data;
     pkt->size = len;
 
@@ -500,6 +668,154 @@ static gboolean destroy_widget_idle(gpointer data) {
     return FALSE;
 }
 
+// Ask the server for a fresh IDR keyframe (rate-limited). Used to recover quickly from
+// UDP packet/frame loss rather than waiting for the encoder's periodic GOP boundary.
+static void request_keyframe(void) {
+    unsigned long long now = vv_now_ms();
+    if (now - udp_last_keyframe_request_ms < 500) return;
+    udp_last_keyframe_request_ms = now;
+    if (vnc_fd >= 0) {
+        uint8_t msg = VNC_MSG_REQUEST_KEYFRAME;
+        send(vnc_fd, &msg, 1, 0);
+    }
+}
+
+// Send an authenticated Hello/heartbeat datagram: opens the NAT mapping on first send and
+// keeps it (and the server's liveness timer) alive afterwards.
+static void udp_send_hello(void) {
+    if (udp_fd < 0) return;
+    uint8_t out[VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN];
+    int len = udp_seal(udp_key, VNC_UDP_TYPE_HELLO, udp_cid, udp_send_ctr++, NULL, 0, out, sizeof(out));
+    if (len > 0) {
+        sendto(udp_fd, out, (size_t)len, 0, (struct sockaddr*)&udp_server_addr, sizeof(udp_server_addr));
+    }
+    udp_last_heartbeat_ms = vv_now_ms();
+}
+
+// Handle the one-time VNC_ENCODING_UDP_SETUP rectangle: sets up the local UDP socket + key
+// and immediately punches a Hello through to the server.
+static void udp_handle_setup(const uint8_t* payload) {
+    uint16_t port = read_u16_be(payload);
+    memcpy(udp_cid, payload + 2, VNC_UDP_CID_LEN);
+    memcpy(udp_key, payload + 2 + VNC_UDP_CID_LEN, VNC_UDP_KEY_LEN);
+
+    if (udp_fd < 0) {
+        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    }
+    memset(&udp_server_addr, 0, sizeof(udp_server_addr));
+    udp_server_addr.sin_family = AF_INET;
+    udp_server_addr.sin_port = htons(port);
+    udp_server_addr.sin_addr = udp_server_in_addr;
+
+    udp_send_ctr = 0;
+    udp_recv_replay.highest = 0;
+    udp_recv_replay.bitmap = 0;
+    reasm_active = 0;
+    have_last_completed_frame = 0;
+
+    if (udp_fd >= 0) {
+        udp_active = 1;
+        udp_send_hello();
+    }
+}
+
+static void reasm_start(uint32_t frame_id, uint16_t frag_count) {
+    size_t needed = (size_t)frag_count * VNC_UDP_MAX_FRAG_PAYLOAD;
+    if (needed > reasm_buf_cap) {
+        uint8_t* new_buf = realloc(reasm_buf, needed);
+        if (!new_buf) return; // drop this frame; we'll pick up the next one
+        reasm_buf = new_buf;
+        reasm_buf_cap = needed;
+    }
+    memset(reasm_got_bitmap, 0, sizeof(reasm_got_bitmap));
+    reasm_frame_id = frame_id;
+    reasm_frag_count = frag_count;
+    reasm_frags_got = 0;
+    reasm_last_frag_len = 0;
+    reasm_active = 1;
+}
+
+// Process one authenticated+decrypted VIDEO payload (inner header + fragment bytes).
+static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
+    if (pt_len < VNC_UDP_INNER_HDR_LEN) return;
+
+    uint32_t frame_id = read_u32_be(pt);
+    uint16_t frag_idx = read_u16_be(pt + 4);
+    uint16_t frag_count = read_u16_be(pt + 6);
+    uint8_t flags = pt[8];
+    int frag_len = pt_len - VNC_UDP_INNER_HDR_LEN;
+
+    if (frag_count == 0 || frag_count > VNC_UDP_MAX_FRAGS || frag_idx >= frag_count) return;
+
+    if (!reasm_active || frame_id != reasm_frame_id) {
+        // A new frame started before the previous one finished (or this is simply the
+        // first frame seen) — dropping the stale partial frame is the right call for
+        // latency, but it also means we lost data, so ask for a keyframe to recover.
+        if (reasm_active && reasm_frags_got < reasm_frag_count) {
+            request_keyframe();
+        }
+        if (have_last_completed_frame && frame_id != last_completed_frame_id + 1) {
+            request_keyframe();
+        }
+        reasm_start(frame_id, frag_count);
+    }
+    if (!reasm_active || !reasm_buf) return;
+
+    size_t byte_off = (size_t)frag_idx * VNC_UDP_MAX_FRAG_PAYLOAD;
+    if (byte_off + (size_t)frag_len > reasm_buf_cap) return;
+
+    if (!(reasm_got_bitmap[frag_idx / 8] & (1 << (frag_idx % 8)))) {
+        memcpy(reasm_buf + byte_off, pt + VNC_UDP_INNER_HDR_LEN, (size_t)frag_len);
+        reasm_got_bitmap[frag_idx / 8] |= (1 << (frag_idx % 8));
+        reasm_frags_got++;
+        reasm_flags = flags;
+        if (frag_idx == frag_count - 1) reasm_last_frag_len = (uint16_t)frag_len;
+    }
+
+    if (reasm_frags_got == reasm_frag_count) {
+        size_t total_len = (size_t)(reasm_frag_count - 1) * VNC_UDP_MAX_FRAG_PAYLOAD + reasm_last_frag_len;
+
+        if (reasm_flags & 2) {
+            reset_decoder(screen_w, screen_h);
+        }
+        if (total_len > 0) {
+            decode_h264(reasm_buf, (int)total_len, backbuffer, screen_w, screen_h);
+        }
+
+        have_last_completed_frame = 1;
+        last_completed_frame_id = frame_id;
+        reasm_active = 0;
+
+        pthread_mutex_lock(&backbuffer_mutex);
+        waiting_for_draw = 1;
+        pthread_mutex_unlock(&backbuffer_mutex);
+        g_idle_add((GSourceFunc)queue_draw_idle, NULL);
+    }
+}
+
+// Drain all pending datagrams on udp_fd and feed authenticated VIDEO payloads to the
+// frame reassembler. Bounded so one call can't monopolize the network thread.
+static void udp_drain(void) {
+    uint8_t buf[VNC_UDP_MAX_DATAGRAM];
+    uint8_t plaintext[VNC_UDP_MAX_DATAGRAM];
+
+    for (int iter = 0; iter < 256; iter++) {
+        ssize_t n = recvfrom(udp_fd, buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL);
+        if (n <= 0) return;
+        if (n < VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN) continue;
+        if (buf[0] != VNC_UDP_TYPE_VIDEO) continue; // only the server sends VIDEO datagrams
+        if (memcmp(buf + 1, udp_cid, VNC_UDP_CID_LEN) != 0) continue;
+
+        uint8_t type = 0;
+        uint64_t counter = 0;
+        int pt_len = 0;
+        if (udp_open(udp_key, buf, (int)n, &type, &counter, plaintext, &pt_len) < 0) continue;
+        if (!udp_replay_check(&udp_recv_replay, counter)) continue;
+
+        reasm_add_fragment(plaintext, pt_len);
+    }
+}
+
 // Background network client loop thread (after handshake is complete)
 static void* vnc_client_thread(void* arg) {
     (void)arg;
@@ -508,13 +824,14 @@ static void* vnc_client_thread(void* arg) {
     int h = screen_h;
 
     // Send SetEncodings
-    uint8_t encs_msg[64];
+    uint8_t encs_msg[128];
     encs_msg[0] = 2; 
     encs_msg[1] = 0;
 
     int num_encs = 0;
     if (strcmp(preferred_encoding, "h264") == 0) {
         write_u32_be(encs_msg + 4 + (num_encs++) * 4, 50); // H.264
+        write_u32_be(encs_msg + 4 + (num_encs++) * 4, VNC_ENCODING_UDP_SETUP); // opt into the UDP transport
         write_u32_be(encs_msg + 4 + (num_encs++) * 4, 7);  // Tight (JPEG)
         write_u32_be(encs_msg + 4 + (num_encs++) * 4, 5);  // Hextile
     } else if (strcmp(preferred_encoding, "jpeg") == 0) {
@@ -533,6 +850,31 @@ static void* vnc_client_thread(void* arg) {
 
     client_running = 1;
     while (client_running) {
+        struct pollfd pfds[2];
+        pfds[0].fd = fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].fd = udp_fd; // may be -1 until the UDP setup rect arrives; poll() ignores that
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+
+        int pr = poll(pfds, 2, 1000); // wake at least once/sec to service the UDP heartbeat
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (udp_active && vv_now_ms() - udp_last_heartbeat_ms >= VNC_UDP_HEARTBEAT_INTERVAL_MS) {
+            udp_send_hello();
+        }
+
+        if (pfds[1].revents & POLLIN) {
+            udp_drain();
+        }
+
+        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (!(pfds[0].revents & POLLIN)) continue;
+
         uint8_t msg_type = 0;
         if (recv(fd, &msg_type, 1, 0) <= 0) break;
 
@@ -621,6 +963,11 @@ static void* vnc_client_thread(void* arg) {
                     }
                     free(payload);
                 }
+                else if (encoding == VNC_ENCODING_UDP_SETUP) {
+                    uint8_t setup_payload[VNC_UDP_SETUP_PAYLOAD_LEN];
+                    if (read_exact(fd, setup_payload, sizeof(setup_payload)) < 0) goto exit_thread;
+                    udp_handle_setup(setup_payload);
+                }
             }
 
             pthread_mutex_lock(&backbuffer_mutex);
@@ -635,6 +982,16 @@ exit_thread:
     client_running = 0;
     vnc_fd = -1;
     close(fd);
+    if (udp_fd >= 0) {
+        close(udp_fd);
+        udp_fd = -1;
+    }
+    udp_active = 0;
+    memset(udp_key, 0, sizeof(udp_key)); // don't leave session key material lying around
+    free(reasm_buf);
+    reasm_buf = NULL;
+    reasm_buf_cap = 0;
+    reasm_active = 0;
     if (viewer_window) {
         g_idle_add(destroy_widget_idle, viewer_window);
     }
@@ -770,6 +1127,7 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr = *(struct in_addr*)he->h_addr;
+    udp_server_in_addr = addr.sin_addr; // remembered for the UDP H.264 side-channel
 
     // Timeout connecting in case of unreachable hosts (default 3 seconds)
     struct timeval tv;
