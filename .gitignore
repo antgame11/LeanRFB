@@ -5,6 +5,12 @@ examples/*.o
 # Libraries
 *.a
 *.o
+
 # Executables
 demo_server
 x11_vnc_server
+vncviewer
+
+# Configs
+x11_vnc_server.conf
+vncviewer

@@ -28,7 +28,14 @@ void* vnc_h264_encoder_create(int width, int height, int fps, int quality) {
     param.i_fps_den = 1;
     param.i_keyint_max = fps * 2; // Keyframe every 2 seconds
     param.b_intra_refresh = 1;
-    param.i_threads = 1; // Single-threaded for zero lookahead latency
+    
+    // CRITICAL: Disable all encoding lookahead and buffering to achieve true zero-latency.
+    // Enable slice-based multi-threaded encoding to leverage all CPU cores in parallel.
+    param.i_threads = 0; 
+    param.b_sliced_threads = 1;
+    param.i_sync_lookahead = 0;
+    param.rc.i_lookahead = 0;
+    param.i_bframe = 0;
 
     if (x264_param_apply_profile(&param, "baseline") < 0) {
         free(enc);
@@ -71,24 +78,27 @@ int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_dat
     uint8_t* u = enc->pic_in.img.plane[1];
     uint8_t* v = enc->pic_in.img.plane[2];
 
-    // BGRA to YUV420p color-space conversion
+    // High performance integer shift-and-add BGRA8888-to-YUV420p converter
     for (int row = 0; row < h; row++) {
         const uint32_t* src_row = fb + row * w;
+        int row_offset = row * w;
+        int uv_row_offset = (row / 2) * (w / 2);
+        
         for (int col = 0; col < w; col++) {
             uint32_t pixel = src_row[col];
-            uint8_t r = (pixel >> 16) & 0xFF;
-            uint8_t g = (pixel >> 8) & 0xFF;
-            uint8_t b = pixel & 0xFF;
+            int b = pixel & 0xFF;
+            int g = (pixel >> 8) & 0xFF;
+            int r = (pixel >> 16) & 0xFF;
 
-            int Y = (int)(0.299f * r + 0.587f * g + 0.114f * b);
-            y[row * w + col] = (uint8_t)(Y < 0 ? 0 : (Y > 255 ? 255 : Y));
+            int Y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            y[row_offset + col] = (uint8_t)Y;
 
             if (row % 2 == 0 && col % 2 == 0) {
-                int U = (int)(-0.169f * r - 0.331f * g + 0.500f * b + 128);
-                int V = (int)(0.500f * r - 0.419f * g - 0.081f * b + 128);
-                int uv_idx = (row / 2) * (w / 2) + (col / 2);
-                u[uv_idx] = (uint8_t)(U < 0 ? 0 : (U > 255 ? 255 : U));
-                v[uv_idx] = (uint8_t)(V < 0 ? 0 : (V > 255 ? 255 : V));
+                int U = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                int V = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                int uv_idx = uv_row_offset + (col / 2);
+                u[uv_idx] = (uint8_t)U;
+                v[uv_idx] = (uint8_t)V;
             }
         }
     }
