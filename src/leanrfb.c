@@ -540,6 +540,8 @@ int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
 void vnc_server_update_framebuffer(vnc_server_t* server, const uint32_t* fb_data) {
     if (!server || !fb_data) return;
 
+    memset(server->server_dirty, 0, (size_t)server->cols * server->rows);
+
     for (int y = 0; y < server->height; y++) {
         size_t row_offset = y * (size_t)server->width;
         size_t row_bytes = (size_t)server->width * 4;
