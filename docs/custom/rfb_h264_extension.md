@@ -2,6 +2,10 @@
 
 This document specifies the Open H.264 video compression encoding extension for the Remote Framebuffer (RFB) protocol.
 
+> For low-latency, gaming-style delivery of this same H.264 stream over an encrypted UDP
+> side-channel (instead of the TCP delivery described below), see the companion
+> [UDP Transport Extension](rfb_h264_udp_extension.md).
+
 ## 1. Encoding Negotiation
 
 During the initial connection handshake, after authentication completes, the client sends a VNC `SetEncodings` message to advertise its capabilities.

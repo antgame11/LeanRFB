@@ -122,6 +122,7 @@ int main(int argc, char* argv[]) {
     char config_name[128] = {0};
     int max_clients = 16;
     int websocket_enabled = 0;
+    int udp_enabled = 1;
     const char* password = NULL;
     const char* listen_host = "0.0.0.0";
     const char* display_name = "leanrfb X11 Server";
@@ -173,6 +174,12 @@ int main(int argc, char* argv[]) {
                 } else {
                     websocket_enabled = 0;
                 }
+            } else if (strcmp(key, "enable_udp") == 0) {
+                if (strcmp(value, "y") == 0 || strcmp(value, "yes") == 0 || strcmp(value, "1") == 0 || strcmp(value, "true") == 0) {
+                    udp_enabled = 1;
+                } else {
+                    udp_enabled = 0;
+                }
             }
         }
         fclose(cf);
@@ -212,6 +219,7 @@ int main(int argc, char* argv[]) {
     } else {
         printf("Authentication disabled (no password configured).\n");
     }
+    printf("Encrypted UDP transport for H.264 video: %s\n", udp_enabled ? "enabled" : "disabled (TCP only)");
 
     // Context for callbacks
     x11_ctx_t ctx;
@@ -229,6 +237,7 @@ int main(int argc, char* argv[]) {
     config.password = password;
     config.max_clients = max_clients;
     config.websocket = websocket_enabled;
+    config.disable_udp_h264 = !udp_enabled;
     config.on_key = on_key;
     config.on_pointer = on_pointer;
     config.user_data = &ctx;
