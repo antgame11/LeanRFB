@@ -83,6 +83,17 @@ static inline uint32_t read_u32_be(const uint8_t *buf) {
 #define VNC_ENCODING_VP9 52
 #define VNC_MSG_REQUEST_KEYFRAME 254
 
+// --- Live desktop resize: standard RFB ExtendedDesktopSize/SetDesktopSize extension
+// (see docs/custom/rfb_desktop_resize_extension.md). Constants verified byte-for-byte
+// against the reference LibVNCServer implementation.
+#define VNC_ENCODING_EXT_DESKTOP_SIZE ((int32_t)0xFFFFFECC) // -308
+#define VNC_MSG_SET_DESKTOP_SIZE 251
+#define VNC_EDS_STATUS_SUCCESS 0
+// How long to wait after the drawing area's size stops changing before actually asking
+// the server to resize (dragging a window edge fires many events per second — we only
+// want to act once it settles).
+#define VNC_RESIZE_DEBOUNCE_MS 400
+
 typedef struct {
     uint64_t highest;
     uint64_t bitmap;
@@ -269,6 +280,13 @@ static volatile int client_running = 0;
 static uint8_t button_mask = 0;
 static char preferred_encoding[32] = "h264";
 static volatile int waiting_for_draw = 0;
+
+// Live desktop resize (see docs/custom/rfb_desktop_resize_extension.md). The debounce
+// timer and pending size are only ever touched on the GTK main thread (configure-event
+// handler + its own timeout callback).
+static guint resize_debounce_source = 0;
+static int pending_resize_w = 0;
+static int pending_resize_h = 0;
 
 // UDP H.264 transport state (owned by vnc_client_thread; see docs/custom/rfb_h264_udp_extension.md)
 static int udp_fd = -1;
@@ -594,13 +612,64 @@ int read_exact(int fd, void* buf, size_t len) {
 
 static void send_fb_request(int fd, uint8_t incremental, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     uint8_t buf[10];
-    buf[0] = 3; 
+    buf[0] = 3;
     buf[1] = incremental;
     write_u16_be(buf + 2, x);
     write_u16_be(buf + 4, y);
     write_u16_be(buf + 6, w);
     write_u16_be(buf + 8, h);
     send(fd, buf, 10, 0);
+}
+
+// Send the RFB SetDesktopSize message (live resize request) — a single screen covering
+// the whole requested framebuffer, matching this server's single-display model.
+static void send_desktop_resize_request(int fd, uint16_t w, uint16_t h) {
+    uint8_t buf[8 + 16];
+    buf[0] = VNC_MSG_SET_DESKTOP_SIZE;
+    buf[1] = 0; // pad
+    write_u16_be(buf + 2, w);
+    write_u16_be(buf + 4, h);
+    buf[6] = 1; // number-of-screens
+    buf[7] = 0; // pad
+    write_u32_be(buf + 8, 0);  // screen id
+    write_u16_be(buf + 12, 0); // x
+    write_u16_be(buf + 14, 0); // y
+    write_u16_be(buf + 16, w);
+    write_u16_be(buf + 18, h);
+    write_u32_be(buf + 20, 0); // flags
+    send(fd, buf, sizeof(buf), 0);
+}
+
+// Fired VNC_RESIZE_DEBOUNCE_MS after the drawing area's size last changed (see
+// on_drawing_area_configure) — actually asks the server to resize the remote desktop.
+static gboolean send_resize_request_now(gpointer data) {
+    (void)data;
+    resize_debounce_source = 0;
+    // If the size already matches what we think the remote desktop is, there's nothing
+    // to request — this also suppresses the redundant round-trip that would otherwise
+    // happen when WE resize the window in response to the server's own confirmation
+    // (see apply_remote_desktop_size below).
+    if (vnc_fd >= 0 && (pending_resize_w != screen_w || pending_resize_h != screen_h) &&
+        pending_resize_w > 0 && pending_resize_h > 0) {
+        DEBUG_LOG("Requesting live desktop resize to %dx%d", pending_resize_w, pending_resize_h);
+        send_desktop_resize_request(vnc_fd, (uint16_t)pending_resize_w, (uint16_t)pending_resize_h);
+    }
+    return FALSE; // one-shot
+}
+
+static gboolean on_drawing_area_configure(GtkWidget* widget, GdkEventConfigure* event, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    if (vnc_fd < 0) return FALSE;
+    if (event->width == screen_w && event->height == screen_h) return FALSE;
+
+    pending_resize_w = event->width;
+    pending_resize_h = event->height;
+    if (resize_debounce_source) {
+        g_source_remove(resize_debounce_source);
+    }
+    resize_debounce_source = g_timeout_add(VNC_RESIZE_DEBOUNCE_MS, send_resize_request_now, NULL);
+    return FALSE;
 }
 
 // Drawing area callbacks
@@ -707,6 +776,20 @@ static gboolean destroy_widget_idle(gpointer data) {
     if (data && data == viewer_window) {
         gtk_widget_destroy(GTK_WIDGET(viewer_window));
         viewer_window = NULL;
+    }
+    return FALSE;
+}
+
+// Reflect a server-confirmed desktop resize (screen_w/screen_h must already be updated
+// by the caller) in the actual GTK window. Must run on the main thread — scheduled via
+// g_idle_add from the network thread.
+static gboolean apply_remote_desktop_size_idle(gpointer data) {
+    (void)data;
+    if (viewer_window) {
+        gtk_window_resize(GTK_WINDOW(viewer_window), screen_w, screen_h);
+    }
+    if (drawing_area) {
+        gtk_widget_queue_draw(drawing_area);
     }
     return FALSE;
 }
@@ -936,6 +1019,8 @@ static void* vnc_client_thread(void* arg) {
         write_u32_be(encs_msg + 4 + (num_encs++) * 4, 5);  // Hextile
     }
     write_u32_be(encs_msg + 4 + (num_encs++) * 4, 0); // Raw fallback
+    // Live desktop resize is orthogonal to the pixel encoding, so it's always advertised.
+    write_u32_be(encs_msg + 4 + (num_encs++) * 4, (uint32_t)VNC_ENCODING_EXT_DESKTOP_SIZE);
     write_u16_be(encs_msg + 2, num_encs);
 
     DEBUG_LOG("SetEncodings: sending %d encodings (preferred=%s)", num_encs, preferred_encoding);
@@ -1070,6 +1155,47 @@ static void* vnc_client_thread(void* arg) {
                     uint8_t setup_payload[VNC_UDP_SETUP_PAYLOAD_LEN];
                     if (read_exact(fd, setup_payload, sizeof(setup_payload)) < 0) goto exit_thread;
                     udp_handle_setup(setup_payload);
+                }
+                else if (encoding == (uint32_t)VNC_ENCODING_EXT_DESKTOP_SIZE) {
+                    // rx = reason (0=generic/initial, 1=our own request, 2=another client's
+                    // request), ry = status (0=success, nonzero=one of the RFB error codes).
+                    // rw/rh = the framebuffer size this applies to.
+                    uint8_t eds_hdr[4];
+                    if (read_exact(fd, eds_hdr, 4) < 0) goto exit_thread;
+                    uint8_t num_screens = eds_hdr[0];
+                    size_t screens_len = (size_t)num_screens * 16;
+                    if (screens_len > 0) {
+                        uint8_t* screens_buf = malloc(screens_len);
+                        // We only act on the overall framebuffer size (rw/rh); the
+                        // per-screen layout list isn't meaningful for this single-window
+                        // client, so it's read only to stay in sync with the stream.
+                        if (read_exact(fd, screens_buf, screens_len) < 0) {
+                            free(screens_buf);
+                            goto exit_thread;
+                        }
+                        free(screens_buf);
+                    }
+
+                    DEBUG_LOG("ExtendedDesktopSize: reason=%u status=%u size=%ux%u", rx, ry, rw, rh);
+
+                    if (ry == VNC_EDS_STATUS_SUCCESS && rw > 0 && rh > 0 && (rw != screen_w || rh != screen_h)) {
+                        pthread_mutex_lock(&backbuffer_mutex);
+                        backbuffer = realloc(backbuffer, (size_t)rw * rh * 4);
+                        memset(backbuffer, 0, (size_t)rw * rh * 4);
+                        screen_w = rw;
+                        screen_h = rh;
+                        pthread_mutex_unlock(&backbuffer_mutex);
+
+                        // w/h are this thread's own locals used for every decode_video()
+                        // call below — the server always follows this notification with a
+                        // forced keyframe at the new size, so the next reset_decoder() call
+                        // will (re)init at the right dimensions as long as these are
+                        // updated first.
+                        w = rw;
+                        h = rh;
+
+                        g_idle_add(apply_remote_desktop_size_idle, NULL);
+                    }
                 }
             }
 
@@ -1408,6 +1534,7 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     g_signal_connect(G_OBJECT(drawing_area), "scroll-event", G_CALLBACK(on_scroll), NULL);
     g_signal_connect(G_OBJECT(drawing_area), "key-press-event", G_CALLBACK(on_key_event), NULL);
     g_signal_connect(G_OBJECT(drawing_area), "key-release-event", G_CALLBACK(on_key_event), NULL);
+    g_signal_connect(G_OBJECT(drawing_area), "configure-event", G_CALLBACK(on_drawing_area_configure), NULL);
 
     g_signal_connect(G_OBJECT(viewer_window), "destroy", G_CALLBACK(on_viewer_destroy), NULL);
 
