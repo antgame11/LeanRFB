@@ -246,8 +246,12 @@ static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req
             int min_w, min_h, max_w, max_h;
             XRRGetScreenSizeRange(dpy, root, &min_w, &min_h, &max_w, &max_h);
 
-            int cur_w = (int)crtc_info->width;
-            int cur_h = (int)crtc_info->height;
+            // Query live root window attributes directly from the X server
+            XWindowAttributes wa;
+            XGetWindowAttributes(dpy, root, &wa);
+            int cur_w = wa.width;
+            int cur_h = wa.height;
+
             int grown_w = best_w > cur_w ? best_w : cur_w;
             int grown_h = best_h > cur_h ? best_h : cur_h;
             if (grown_w > max_w) grown_w = max_w;
@@ -264,8 +268,11 @@ static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req
                 // (best-effort; harmless no-op if it's already that size).
                 XRRSetScreenSize(dpy, root, best_w, best_h, out_info->mm_width, out_info->mm_height);
                 XSync(dpy, False);
-                *out_w = best_w;
-                *out_h = best_h;
+
+                // Query the final actual size of the root window to ensure the capture buffers match it exactly
+                XGetWindowAttributes(dpy, root, &wa);
+                *out_w = wa.width;
+                *out_h = wa.height;
                 applied = 1;
             }
             XRRFreeCrtcInfo(crtc_info);
