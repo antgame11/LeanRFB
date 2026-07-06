@@ -17,7 +17,18 @@
 
 typedef struct {
     Display* dpy;
+    Window root;
+    int screen_num;
     uint8_t last_buttons;
+
+    // Capture state — mutable because a live desktop resize (see on_resize_request
+    // below) reallocates all of this at runtime, not just once at startup.
+    uint32_t* fb;
+    int width;
+    int height;
+    int has_shm;
+    XShmSegmentInfo shminfo;
+    XImage* shm_img;
 } x11_ctx_t;
 
 static void on_key(vnc_server_t* server, vnc_client_t* client, uint32_t keysym, int down, void* user_data) {
@@ -109,6 +120,67 @@ static void copy_ximage_to_fb(XImage* img, uint32_t* fb) {
     }
 }
 
+// Free whatever capture buffers ctx currently holds (MIT-SHM segment/image and the
+// plain fb buffer), leaving it in a state where setup_capture_buffers() can be called
+// again. Safe to call on a freshly-zeroed ctx (all fields NULL/0).
+static void teardown_capture_buffers(x11_ctx_t* ctx) {
+    if (ctx->has_shm) {
+        XShmDetach(ctx->dpy, &ctx->shminfo);
+        shmdt(ctx->shminfo.shmaddr);
+        shmctl(ctx->shminfo.shmid, IPC_RMID, 0);
+        XDestroyImage(ctx->shm_img);
+        ctx->shm_img = NULL;
+        ctx->has_shm = 0;
+    }
+    free(ctx->fb);
+    ctx->fb = NULL;
+}
+
+// (Re)allocate the capture buffers (MIT-SHM image + plain fb) for a width x height
+// capture, tearing down whatever ctx previously held first. Called once at startup and
+// again every time the display is actually resized (see on_resize_request).
+// Returns 1 on success, 0 on hard failure (out of memory) — MIT-SHM being unavailable is
+// not a hard failure, it just means the slower XGetImage fallback path is used.
+static int setup_capture_buffers(x11_ctx_t* ctx, int width, int height) {
+    teardown_capture_buffers(ctx);
+    ctx->width = width;
+    ctx->height = height;
+
+    if (XShmQueryExtension(ctx->dpy)) {
+        ctx->shm_img = XShmCreateImage(ctx->dpy, DefaultVisual(ctx->dpy, ctx->screen_num),
+                                       (unsigned int)DefaultDepth(ctx->dpy, ctx->screen_num),
+                                       ZPixmap, NULL, &ctx->shminfo, (unsigned int)width, (unsigned int)height);
+        if (ctx->shm_img) {
+            ctx->shminfo.shmid = shmget(IPC_PRIVATE, (size_t)ctx->shm_img->bytes_per_line * (size_t)ctx->shm_img->height,
+                                        IPC_CREAT | 0600);
+            if (ctx->shminfo.shmid >= 0) {
+                ctx->shminfo.shmaddr = ctx->shm_img->data = shmat(ctx->shminfo.shmid, 0, 0);
+                if (ctx->shminfo.shmaddr != (char*)-1) {
+                    ctx->shminfo.readOnly = False;
+                    if (XShmAttach(ctx->dpy, &ctx->shminfo)) {
+                        ctx->has_shm = 1;
+                    } else {
+                        shmdt(ctx->shminfo.shmaddr);
+                        shmctl(ctx->shminfo.shmid, IPC_RMID, 0);
+                        XDestroyImage(ctx->shm_img);
+                        ctx->shm_img = NULL;
+                    }
+                } else {
+                    shmctl(ctx->shminfo.shmid, IPC_RMID, 0);
+                    XDestroyImage(ctx->shm_img);
+                    ctx->shm_img = NULL;
+                }
+            } else {
+                XDestroyImage(ctx->shm_img);
+                ctx->shm_img = NULL;
+            }
+        }
+    }
+
+    ctx->fb = malloc((size_t)width * (size_t)height * sizeof(uint32_t));
+    return ctx->fb != NULL;
+}
+
 #include <time.h>
 
 static unsigned long long get_time_ms(void) {
@@ -117,11 +189,13 @@ static unsigned long long get_time_ms(void) {
     return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-// Attempt to switch the X display's first connected output to an existing mode that's
-// exactly req_w x req_h via XRandR (the same mechanism `xrandr --output ... --mode WxH`
-// uses). This only selects among modes the driver already advertises — it does not
-// synthesize a new modeline — so it works well for common resolutions real drivers/VMs
-// already list, but an uncommon custom size may not be available.
+// Attempt to switch the X display's first connected output to an existing mode via
+// XRandR (the same mechanism `xrandr --output ... --mode WxH` uses). This only selects
+// among modes the driver already advertises — it does not synthesize a new modeline.
+// An exact req_w x req_h match is preferred; if none exists (very likely when driven by
+// an arbitrary window-drag size rather than a fixed admin-chosen resolution), the mode
+// with the smallest combined width+height difference is used instead, so live resizing
+// still does something reasonable rather than simply failing for any non-standard size.
 //
 // Assumes a single-output setup (typical for a shared VNC desktop/VM): the screen
 // bounding box is grown before the mode switch (required for it to fit) and then shrunk
@@ -129,7 +203,8 @@ static unsigned long long get_time_ms(void) {
 // this is intentionally scoped to the common single-display case.
 //
 // Returns 1 and sets *out_w/*out_h to the resolution actually applied on success; returns
-// 0 (leaving *out_w/*out_h untouched) if no matching mode was found or the switch failed.
+// 0 (leaving *out_w/*out_h untouched) if the output has no usable modes or the switch
+// failed.
 static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req_w, int req_h, int* out_w, int* out_h) {
     XRRScreenResources* res = XRRGetScreenResources(dpy, root);
     if (!res) return 0;
@@ -143,16 +218,23 @@ static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req
             continue;
         }
 
-        RRMode found_mode = 0;
-        for (int mi = 0; mi < out_info->nmode && !found_mode; mi++) {
+        RRMode best_mode = 0;
+        int best_w = 0, best_h = 0;
+        long best_diff = -1;
+        for (int mi = 0; mi < out_info->nmode; mi++) {
             for (int r = 0; r < res->nmode; r++) {
-                if (res->modes[r].id == out_info->modes[mi] &&
-                    (int)res->modes[r].width == req_w && (int)res->modes[r].height == req_h) {
-                    found_mode = res->modes[r].id;
-                    break;
+                if (res->modes[r].id != out_info->modes[mi]) continue;
+                long diff = labs((long)res->modes[r].width - req_w) + labs((long)res->modes[r].height - req_h);
+                if (best_diff < 0 || diff < best_diff) {
+                    best_diff = diff;
+                    best_mode = res->modes[r].id;
+                    best_w = (int)res->modes[r].width;
+                    best_h = (int)res->modes[r].height;
                 }
+                break;
             }
         }
+        RRMode found_mode = best_mode;
         if (!found_mode) {
             XRRFreeOutputInfo(out_info);
             continue;
@@ -165,8 +247,8 @@ static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req
 
             int cur_w = DisplayWidth(dpy, screen_num);
             int cur_h = DisplayHeight(dpy, screen_num);
-            int grown_w = req_w > cur_w ? req_w : cur_w;
-            int grown_h = req_h > cur_h ? req_h : cur_h;
+            int grown_w = best_w > cur_w ? best_w : cur_w;
+            int grown_h = best_h > cur_h ? best_h : cur_h;
             if (grown_w > max_w) grown_w = max_w;
             if (grown_h > max_h) grown_h = max_h;
             if (grown_w != cur_w || grown_h != cur_h) {
@@ -177,9 +259,9 @@ static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req
                                          crtc_info->x, crtc_info->y, found_mode,
                                          crtc_info->rotation, &res->outputs[oi], 1);
             if (st == Success) {
-                // Shrink the bounding box back down to exactly the new mode (best-effort;
-                // harmless no-op if it's already that size).
-                XRRSetScreenSize(dpy, root, req_w, req_h, out_info->mm_width, out_info->mm_height);
+                // Shrink the bounding box back down to exactly the applied mode
+                // (best-effort; harmless no-op if it's already that size).
+                XRRSetScreenSize(dpy, root, best_w, best_h, out_info->mm_width, out_info->mm_height);
                 XSync(dpy, False);
                 *out_w = DisplayWidth(dpy, screen_num);
                 *out_h = DisplayHeight(dpy, screen_num);
@@ -192,6 +274,41 @@ static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req
 
     XRRFreeScreenResources(res);
     return applied;
+}
+
+// Set once the display has ever been resized away from its startup resolution (whether
+// via the static resize_resolution config option or a live client request), so it can be
+// restored on clean shutdown.
+static int g_did_resize = 0;
+
+// vnc_server_config_t.on_resize_request: invoked when a client sends SetDesktopSize and
+// allow_resize=y. Drives the actual XRandR mode switch and reallocates the capture
+// buffers to match — the two things that make this a *live*, not just negotiated, resize.
+static int on_resize_request(vnc_server_t* server, vnc_client_t* client,
+                             uint16_t req_w, uint16_t req_h,
+                             uint16_t* out_w, uint16_t* out_h, void* user_data) {
+    (void)client;
+    (void)server;
+    x11_ctx_t* ctx = (x11_ctx_t*)user_data;
+
+    int applied_w = 0, applied_h = 0;
+    if (!x11_set_resolution(ctx->dpy, ctx->root, ctx->screen_num, req_w, req_h, &applied_w, &applied_h)) {
+        fprintf(stderr, "Resize request for %ux%u rejected: no usable XRandR mode on any connected output.\n",
+                req_w, req_h);
+        return VNC_RESIZE_INVALID_LAYOUT;
+    }
+
+    if (!setup_capture_buffers(ctx, applied_w, applied_h)) {
+        fprintf(stderr, "Resize request for %ux%u: XRandR switch succeeded but capture buffer "
+                        "allocation failed.\n", req_w, req_h);
+        return VNC_RESIZE_OUT_OF_RESOURCES;
+    }
+
+    printf("Live-resized X display to %dx%d (client requested %ux%u).\n", applied_w, applied_h, req_w, req_h);
+    g_did_resize = 1;
+    *out_w = (uint16_t)applied_w;
+    *out_h = (uint16_t)applied_h;
+    return VNC_RESIZE_SUCCESS;
 }
 
 static volatile sig_atomic_t g_should_exit = 0;
@@ -209,6 +326,7 @@ int main(int argc, char* argv[]) {
     int websocket_enabled = 0;
     int udp_enabled = 1;
     int resize_w = 0, resize_h = 0; // 0,0 = don't resize; use the display's current resolution
+    int allow_resize_enabled = 0;   // let clients live-resize the desktop (default off)
     const char* password = NULL;
     const char* listen_host = "0.0.0.0";
     const char* display_name = "leanrfb X11 Server";
@@ -274,6 +392,12 @@ int main(int argc, char* argv[]) {
                 } else if (value[0] != '\0') {
                     fprintf(stderr, "Warning: ignoring invalid resize_resolution '%s' (expected WIDTHxHEIGHT)\n", value);
                 }
+            } else if (strcmp(key, "allow_resize") == 0) {
+                if (strcmp(value, "y") == 0 || strcmp(value, "yes") == 0 || strcmp(value, "1") == 0 || strcmp(value, "true") == 0) {
+                    allow_resize_enabled = 1;
+                } else {
+                    allow_resize_enabled = 0;
+                }
             }
         }
         fclose(cf);
@@ -302,26 +426,31 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    int screen_num = DefaultScreen(dpy);
-    Window root = RootWindow(dpy, screen_num);
+    // Context for callbacks — zeroed first since setup_capture_buffers()/teardown
+    // assume has_shm/fb/shm_img start NULL/0.
+    x11_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.dpy = dpy;
+    ctx.screen_num = DefaultScreen(dpy);
+    ctx.root = RootWindow(dpy, ctx.screen_num);
+    ctx.last_buttons = 0;
 
-    int orig_width = DisplayWidth(dpy, screen_num);
-    int orig_height = DisplayHeight(dpy, screen_num);
-    int did_resize = 0;
+    int orig_width = DisplayWidth(dpy, ctx.screen_num);
+    int orig_height = DisplayHeight(dpy, ctx.screen_num);
 
     if (resize_w > 0 && resize_h > 0 && (resize_w != orig_width || resize_h != orig_height)) {
         int applied_w = 0, applied_h = 0;
-        if (x11_set_resolution(dpy, root, screen_num, resize_w, resize_h, &applied_w, &applied_h)) {
+        if (x11_set_resolution(dpy, ctx.root, ctx.screen_num, resize_w, resize_h, &applied_w, &applied_h)) {
             printf("Resized X display from %dx%d to %dx%d via XRandR.\n", orig_width, orig_height, applied_w, applied_h);
-            did_resize = 1;
+            g_did_resize = 1;
         } else {
             fprintf(stderr, "Warning: could not switch to %dx%d (no matching XRandR mode found on any connected "
                              "output) — keeping the current resolution.\n", resize_w, resize_h);
         }
     }
 
-    int width = DisplayWidth(dpy, screen_num);
-    int height = DisplayHeight(dpy, screen_num);
+    int width = DisplayWidth(dpy, ctx.screen_num);
+    int height = DisplayHeight(dpy, ctx.screen_num);
 
     printf("Sharing X11 screen (resolution %dx%d) on port %d...\n", width, height, port);
     if (password) {
@@ -330,11 +459,7 @@ int main(int argc, char* argv[]) {
         printf("Authentication disabled (no password configured).\n");
     }
     printf("Encrypted UDP transport for H.264 video: %s\n", udp_enabled ? "enabled" : "disabled (TCP only)");
-
-    // Context for callbacks
-    x11_ctx_t ctx;
-    ctx.dpy = dpy;
-    ctx.last_buttons = 0;
+    printf("Client-driven live desktop resize: %s\n", allow_resize_enabled ? "enabled" : "disabled");
 
     // Create VNC server
     vnc_server_config_t config;
@@ -348,8 +473,10 @@ int main(int argc, char* argv[]) {
     config.max_clients = max_clients;
     config.websocket = websocket_enabled;
     config.disable_udp_h264 = !udp_enabled;
+    config.allow_desktop_resize = allow_resize_enabled;
     config.on_key = on_key;
     config.on_pointer = on_pointer;
+    config.on_resize_request = on_resize_request;
     config.user_data = &ctx;
 
     vnc_server_t* server = vnc_server_create(&config);
@@ -359,59 +486,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Setup MIT-SHM (Shared Memory)
-    int has_shm = 0;
-    XShmSegmentInfo shminfo;
-    XImage* shm_img = NULL;
-
-    if (XShmQueryExtension(dpy)) {
-        shm_img = XShmCreateImage(dpy, DefaultVisual(dpy, screen_num),
-                                  (unsigned int)DefaultDepth(dpy, screen_num),
-                                  ZPixmap, NULL, &shminfo, (unsigned int)width, (unsigned int)height);
-        if (shm_img) {
-            shminfo.shmid = shmget(IPC_PRIVATE, (size_t)shm_img->bytes_per_line * (size_t)shm_img->height, IPC_CREAT | 0600);
-            if (shminfo.shmid >= 0) {
-                shminfo.shmaddr = shm_img->data = shmat(shminfo.shmid, 0, 0);
-                if (shminfo.shmaddr != (char*)-1) {
-                    shminfo.readOnly = False;
-                    if (XShmAttach(dpy, &shminfo)) {
-                        has_shm = 1;
-                        printf("MIT-SHM Shared Memory extension enabled successfully.\n");
-                    } else {
-                        shmdt(shminfo.shmaddr);
-                        shmctl(shminfo.shmid, IPC_RMID, 0);
-                        XDestroyImage(shm_img);
-                        shm_img = NULL;
-                    }
-                } else {
-                    shmctl(shminfo.shmid, IPC_RMID, 0);
-                    XDestroyImage(shm_img);
-                    shm_img = NULL;
-                }
-            } else {
-                XDestroyImage(shm_img);
-                shm_img = NULL;
-            }
-        }
-    }
-
-    if (!has_shm) {
-        printf("MIT-SHM Shared Memory extension not available. Falling back to standard XGetImage (slower).\n");
-    }
-
-    uint32_t* fb = malloc((size_t)width * (size_t)height * sizeof(uint32_t));
-    if (!fb) {
+    if (!setup_capture_buffers(&ctx, width, height)) {
         fprintf(stderr, "Error: Memory allocation failed for framebuffer\n");
-        if (has_shm) {
-            XShmDetach(dpy, &shminfo);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XDestroyImage(shm_img);
-        }
+        teardown_capture_buffers(&ctx);
         vnc_server_destroy(server);
         XCloseDisplay(dpy);
         return 1;
     }
+    printf(ctx.has_shm ? "MIT-SHM Shared Memory extension enabled successfully.\n"
+                       : "MIT-SHM Shared Memory extension not available. Falling back to standard XGetImage (slower).\n");
 
     int xfixes_event_base = 0;
     int xfixes_error_base = 0;
@@ -437,20 +520,21 @@ int main(int argc, char* argv[]) {
             // Skip capture entirely when no clients are connected — saves the full
             // XShm read + pixel conversion + tile comparison cost at idle.
             if (vnc_server_has_clients(server)) {
-                // Capture screen
-                if (has_shm) {
-                    XShmGetImage(dpy, root, shm_img, 0, 0, AllPlanes);
-                    copy_ximage_to_fb(shm_img, fb);
+                // Capture screen (ctx.width/height/fb/has_shm/shm_img may have changed
+                // since the last iteration if a client requested a live resize)
+                if (ctx.has_shm) {
+                    XShmGetImage(dpy, ctx.root, ctx.shm_img, 0, 0, AllPlanes);
+                    copy_ximage_to_fb(ctx.shm_img, ctx.fb);
                 } else {
-                    XImage* img = XGetImage(dpy, root, 0, 0, (unsigned int)width, (unsigned int)height, AllPlanes, ZPixmap);
+                    XImage* img = XGetImage(dpy, ctx.root, 0, 0, (unsigned int)ctx.width, (unsigned int)ctx.height, AllPlanes, ZPixmap);
                     if (img) {
-                        copy_ximage_to_fb(img, fb);
+                        copy_ximage_to_fb(img, ctx.fb);
                         XDestroyImage(img);
                     }
                 }
 
                 // Send screen updates
-                vnc_server_update_framebuffer(server, fb);
+                vnc_server_update_framebuffer(server, ctx.fb);
 
                 // Update cursor shape if it changed
                 if (has_xfixes) {
@@ -485,21 +569,15 @@ int main(int argc, char* argv[]) {
 
     // Cleanup (reached on SIGINT/SIGTERM)
     printf("\nShutting down...\n");
-    if (did_resize) {
+    if (g_did_resize) {
         int restored_w = 0, restored_h = 0;
-        if (x11_set_resolution(dpy, root, screen_num, orig_width, orig_height, &restored_w, &restored_h)) {
+        if (x11_set_resolution(dpy, ctx.root, ctx.screen_num, orig_width, orig_height, &restored_w, &restored_h)) {
             printf("Restored X display to %dx%d.\n", restored_w, restored_h);
         } else {
             fprintf(stderr, "Warning: could not restore the original %dx%d resolution.\n", orig_width, orig_height);
         }
     }
-    free(fb);
-    if (has_shm) {
-        XShmDetach(dpy, &shminfo);
-        shmdt(shminfo.shmaddr);
-        shmctl(shminfo.shmid, IPC_RMID, 0);
-        XDestroyImage(shm_img);
-    }
+    teardown_capture_buffers(&ctx);
     vnc_server_destroy(server);
     XCloseDisplay(dpy);
     return 0;

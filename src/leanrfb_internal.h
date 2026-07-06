@@ -78,6 +78,25 @@ typedef struct {
 #define VNC_UDP_LIVENESS_TIMEOUT_MS 8000  // no heartbeat/hello within this window -> fall back to TCP
 #define VNC_UDP_HEARTBEAT_INTERVAL_MS 2000
 
+// --- Live desktop resize: standard RFB ExtendedDesktopSize/SetDesktopSize extension
+// (see docs/custom/rfb_desktop_resize_extension.md). Constants match the reference
+// LibVNCServer implementation exactly, verified against its rfbproto.h.
+#define VNC_ENCODING_EXT_DESKTOP_SIZE ((int32_t)0xFFFFFECC) // -308
+#define VNC_MSG_SET_DESKTOP_SIZE 251 // client -> server
+
+// "reason" (rect x-position) values
+#define VNC_EDS_REASON_GENERIC 0       // spontaneous/initial-announcement change
+#define VNC_EDS_REASON_THIS_CLIENT 1   // this client's own SetDesktopSize request
+#define VNC_EDS_REASON_OTHER_CLIENT 2  // a different client's SetDesktopSize request
+
+// "status" (rect y-position) values — identical to the public VNC_RESIZE_* codes in
+// leanrfb.h (VNC_RESIZE_SUCCESS == VNC_EDS_STATUS_SUCCESS, etc.); kept as a separate set
+// of names here only to mirror the protocol's own "reason"/"status" terminology.
+#define VNC_EDS_STATUS_SUCCESS 0
+#define VNC_EDS_STATUS_PROHIBITED 1
+#define VNC_EDS_STATUS_OUT_OF_RESOURCES 2
+#define VNC_EDS_STATUS_INVALID_LAYOUT 3
+
 // Sliding replay window (64 packets) for anti-replay protection of one direction.
 typedef struct {
   uint64_t highest;
@@ -155,6 +174,12 @@ struct vnc_client {
   // Client dirty tracking (flags per tile)
   uint8_t *dirty_tiles; // Array of size cols * rows
 
+  // Live desktop resize (see docs/custom/rfb_desktop_resize_extension.md)
+  int supports_ext_desktop_size;  // client advertised VNC_ENCODING_EXT_DESKTOP_SIZE
+  int pending_ext_desktop_size;   // an ExtendedDesktopSize rect is queued to send
+  int ext_desktop_reason;         // VNC_EDS_REASON_* for the queued rect
+  int ext_desktop_status;         // VNC_EDS_STATUS_* for the queued rect
+
   vnc_client_t *next;
 };
 
@@ -187,6 +212,7 @@ struct vnc_server {
   // Callbacks
   vnc_key_event_cb on_key;
   vnc_pointer_event_cb on_pointer;
+  vnc_resize_request_cb on_resize_request;
   void *user_data;
 
   char *password;
@@ -206,6 +232,8 @@ struct vnc_server {
   // UDP H.264 transport
   int udp_fd;          // datagram socket bound to the same port number as listen_fd, or -1 if disabled
   int disable_udp_h264; // mirrors config->disable_udp_h264
+
+  int allow_desktop_resize; // mirrors config->allow_desktop_resize
 };
 
 // Byte-order conversion helper functions

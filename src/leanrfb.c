@@ -352,6 +352,7 @@ vnc_server_t* vnc_server_create(const vnc_server_config_t* config) {
     server->cursor_yhot = 0;
     server->on_key = config->on_key;
     server->on_pointer = config->on_pointer;
+    server->on_resize_request = config->on_resize_request;
     server->user_data = config->user_data;
     server->password = config->password ? strdup(config->password) : NULL;
     server->max_clients = (config->max_clients > 0) ? config->max_clients : VNC_MAX_CLIENTS_DEFAULT;
@@ -359,6 +360,7 @@ vnc_server_t* vnc_server_create(const vnc_server_config_t* config) {
     server->pfds_cache = NULL;
     server->pfds_cap = 0;
     server->websocket = config->websocket;
+    server->allow_desktop_resize = config->allow_desktop_resize;
 
     if (!server->framebuffer || !server->server_dirty || !server->name) {
         vnc_server_destroy(server);
@@ -648,6 +650,66 @@ void vnc_server_mark_dirty(vnc_server_t* server, uint16_t x, uint16_t y, uint16_
                 client->dirty_tiles[r * server->cols + c] = 1;
                 client = client->next;
             }
+        }
+    }
+}
+
+void vnc_server_resize_framebuffer(vnc_server_t* server, uint16_t new_width, uint16_t new_height) {
+    if (!server || new_width == 0 || new_height == 0) return;
+    if (server->width == new_width && server->height == new_height) return;
+
+    int new_cols = (new_width + 15) / 16;
+    int new_rows = (new_height + 15) / 16;
+
+    uint32_t* new_fb = (uint32_t*)calloc((size_t)new_width * new_height, sizeof(uint32_t));
+    uint8_t* new_dirty = (uint8_t*)calloc((size_t)new_cols * new_rows, sizeof(uint8_t));
+    if (!new_fb || !new_dirty) {
+        // Leave the server at its old (still valid) size rather than applying a
+        // half-updated resize.
+        free(new_fb);
+        free(new_dirty);
+        return;
+    }
+
+    free(server->framebuffer);
+    free(server->server_dirty);
+    server->framebuffer = new_fb;
+    server->server_dirty = new_dirty;
+    server->width = new_width;
+    server->height = new_height;
+    server->cols = new_cols;
+    server->rows = new_rows;
+
+    for (vnc_client_t* client = server->clients; client; client = client->next) {
+        uint8_t* new_client_dirty = (uint8_t*)malloc((size_t)new_cols * new_rows);
+        if (new_client_dirty) {
+            memset(new_client_dirty, 1, (size_t)new_cols * new_rows); // full redraw at the new size
+            free(client->dirty_tiles);
+            client->dirty_tiles = new_client_dirty;
+        }
+
+        // Each client's H.264/VP9 encoder (if any) is sized for the old resolution —
+        // drop it so vnc_send_video_update() lazily recreates it at the new size.
+        if (client->h264_enc) {
+            vnc_h264_encoder_destroy(client->h264_enc);
+            client->h264_enc = NULL;
+        }
+        if (client->vp9_enc) {
+            vnc_vp9_encoder_destroy(client->vp9_enc);
+            client->vp9_enc = NULL;
+        }
+        // Force a fresh UDP handshake (and thus a fresh keyframe) rather than risk any
+        // in-flight fragments/decoder state from the old resolution bleeding into the new
+        // one.
+        client->udp_setup_sent = 0;
+        client->udp_ready = 0;
+        client->force_keyframe_requested = 1;
+        client->update_requested = 1;
+
+        if (client->supports_ext_desktop_size) {
+            client->pending_ext_desktop_size = 1;
+            client->ext_desktop_reason = VNC_EDS_REASON_GENERIC;
+            client->ext_desktop_status = VNC_EDS_STATUS_SUCCESS;
         }
     }
 }
@@ -1101,6 +1163,8 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                 client->supports_h264 = 0;
                 client->supports_vp9 = 0;
                 client->supports_udp = 0;
+                int had_ext_desktop_size = client->supports_ext_desktop_size;
+                client->supports_ext_desktop_size = 0;
                 printf("[VNC SERVER] Client supports encodings: ");
                 for (int i = 0; i < num_encodings; i++) {
                     int32_t enc = (int32_t)read_u32_be(p + 4 + i * 4);
@@ -1115,9 +1179,19 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                         client->supports_vp9 = 1;
                     } else if (enc == VNC_ENCODING_UDP_SETUP) {
                         client->supports_udp = 1;
+                    } else if (enc == VNC_ENCODING_EXT_DESKTOP_SIZE) {
+                        client->supports_ext_desktop_size = 1;
                     } else if (enc == -239) {
                         client->supports_rich_cursor = 1;
                     }
+                }
+                // Per the RFB ExtendedDesktopSize extension: announce the current size
+                // (reason=Generic) the first time a client tells us it understands this
+                // encoding, so it learns it may subsequently send SetDesktopSize.
+                if (client->supports_ext_desktop_size && !had_ext_desktop_size) {
+                    client->pending_ext_desktop_size = 1;
+                    client->ext_desktop_reason = VNC_EDS_REASON_GENERIC;
+                    client->ext_desktop_status = VNC_EDS_STATUS_SUCCESS;
                 }
                 printf("\n");
                 fflush(stdout);
@@ -1164,6 +1238,51 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                 if (length > (uint32_t)VNC_CLIPBOARD_MAX_LEN) goto disconnect;
                 if (remaining < 8 + (size_t)length) break;
                 processed += 8 + (size_t)length;
+            }
+            else if (msg_type == VNC_MSG_SET_DESKTOP_SIZE) { // SetDesktopSize (RFB ExtendedDesktopSize extension)
+                if (remaining < 8) break;
+                uint16_t req_w = read_u16_be(p + 2);
+                uint16_t req_h = read_u16_be(p + 4);
+                uint8_t num_screens = p[6];
+                size_t msg_len = 8 + (size_t)num_screens * 16;
+                if (remaining < msg_len) break;
+                processed += msg_len;
+
+                // We don't need the client's proposed per-screen layout (this server only
+                // ever has one screen) — the bytes were already consumed above so the
+                // stream stays in sync regardless of what we do with them.
+                uint16_t applied_w = req_w;
+                uint16_t applied_h = req_h;
+                int status;
+                if (!server->allow_desktop_resize || !server->on_resize_request) {
+                    status = VNC_RESIZE_PROHIBITED;
+                } else if (req_w == 0 || req_h == 0 || num_screens == 0) {
+                    status = VNC_RESIZE_INVALID_LAYOUT;
+                } else {
+                    status = server->on_resize_request(server, client, req_w, req_h,
+                                                        &applied_w, &applied_h, server->user_data);
+                }
+
+                if (status == VNC_RESIZE_SUCCESS) {
+                    vnc_server_resize_framebuffer(server, applied_w, applied_h);
+                }
+
+                client->pending_ext_desktop_size = 1;
+                client->ext_desktop_reason = VNC_EDS_REASON_THIS_CLIENT;
+                client->ext_desktop_status = status;
+
+                // Per spec: on success, every OTHER client that understands this
+                // extension is also told about the change; on failure, only the
+                // requester hears about it.
+                if (status == VNC_RESIZE_SUCCESS) {
+                    for (vnc_client_t* other = server->clients; other; other = other->next) {
+                        if (other != client && other->supports_ext_desktop_size) {
+                            other->pending_ext_desktop_size = 1;
+                            other->ext_desktop_reason = VNC_EDS_REASON_OTHER_CLIENT;
+                            other->ext_desktop_status = VNC_EDS_STATUS_SUCCESS;
+                        }
+                    }
+                }
             }
             else if (msg_type == 254) { // RequestKeyframe (custom extension, no payload)
                 // Sent by the client when it has dropped a UDP frame it cannot recover
@@ -1339,6 +1458,43 @@ static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client) {
 
     client->write_len = 0;
     client->write_pos = 0;
+
+    // Live desktop resize notification (RFB ExtendedDesktopSize extension). See
+    // docs/custom/rfb_desktop_resize_extension.md.
+    if (client->pending_ext_desktop_size) {
+        uint8_t header[4] = {0, 0, 0, 1};
+        uint8_t r_header[12];
+        write_u16_be(r_header + 0, (uint16_t)client->ext_desktop_reason);
+        write_u16_be(r_header + 2, (uint16_t)client->ext_desktop_status);
+        write_u16_be(r_header + 4, server->width);
+        write_u16_be(r_header + 6, server->height);
+        write_u32_be(r_header + 8, (uint32_t)VNC_ENCODING_EXT_DESKTOP_SIZE);
+
+        // Payload: numberOfScreens(1) + pad(3), then one 16-byte screen structure
+        // describing the single (whole-framebuffer) screen this server exposes.
+        uint8_t payload[20];
+        payload[0] = 1;
+        payload[1] = payload[2] = payload[3] = 0;
+        write_u32_be(payload + 4, 0);                 // screen id
+        write_u16_be(payload + 8, 0);                 // x
+        write_u16_be(payload + 10, 0);                // y
+        write_u16_be(payload + 12, server->width);
+        write_u16_be(payload + 14, server->height);
+        write_u32_be(payload + 16, 0);                // flags
+
+        if (client_buf_append(client, header, 4) == 0 &&
+            client_buf_append(client, r_header, 12) == 0 &&
+            client_buf_append(client, payload, sizeof(payload)) == 0) {
+            client->pending_ext_desktop_size = 0;
+            vnc_client_flush(client);
+
+            if (client->write_len > client->write_pos) {
+                return;
+            }
+            client->write_len = 0;
+            client->write_pos = 0;
+        }
+    }
 
     if (client->send_cursor_update && client->supports_rich_cursor && server->cursor_pixels) {
         size_t mask_bytes_per_row = (server->cursor_w + 7) / 8;
