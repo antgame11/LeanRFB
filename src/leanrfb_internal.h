@@ -46,9 +46,20 @@ typedef struct {
 // Max accepted ClientCutText payload — must be <= VNC_READ_BUF_SIZE - 8
 #define VNC_CLIPBOARD_MAX_LEN (VNC_READ_BUF_SIZE - 8)
 
-// --- UDP H.264 transport (see docs/custom/rfb_h264_udp_extension.md) ---
-// Pseudo-encoding used to negotiate + set up the UDP side-channel.
+// Open VP9 video encoding (see docs/custom/rfb_vp9_extension.md). Same TCP rectangle
+// framing as H.264 (encoding 50): length(4) + flags(4) + raw VP9 frame payload.
+// (VP9 has no NAL/Annex-B structure — the payload is simply the encoder's own complete
+// frame packet, keyframe or inter-frame.)
+#define VNC_ENCODING_VP9 52
+
+// --- UDP video transport (see docs/custom/rfb_h264_udp_extension.md) ---
+// Pseudo-encoding used to negotiate + set up the UDP side-channel. Shared by both H.264
+// and VP9 — the one-time setup payload carries a codec byte (see VNC_UDP_CODEC_*)
+// so the client knows which decoder to instantiate regardless of which encoding was
+// actually negotiated.
 #define VNC_ENCODING_UDP_SETUP 51
+#define VNC_UDP_CODEC_H264 0
+#define VNC_UDP_CODEC_VP9 1
 
 // Datagram type byte (also doubles as the AEAD nonce direction discriminator,
 // so the two directions never share nonce space under the same session key).
@@ -94,7 +105,9 @@ struct vnc_client {
   int send_cursor_update;
   int supports_h264;
   void *h264_enc;
-  int force_keyframe_requested; // set when client asks the encoder to emit a fresh IDR
+  int supports_vp9;
+  void *vp9_enc;
+  int force_keyframe_requested; // set when client asks the encoder to emit a fresh IDR/keyframe
 
   // UDP H.264 transport (see docs/custom/rfb_h264_udp_extension.md)
   int supports_udp;          // client advertised VNC_ENCODING_UDP_SETUP
@@ -286,6 +299,12 @@ int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_dat
 void vnc_h264_encoder_destroy(void* enc_ptr);
 // Force the next encoded frame to be a fresh IDR keyframe (used to recover from UDP packet loss).
 void vnc_h264_encoder_force_keyframe(void* enc_ptr);
+
+// VP9 encoder interface — same signatures/semantics as the H.264 ones above.
+void* vnc_vp9_encoder_create(int width, int height, int fps, int quality);
+int vnc_vp9_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_data, int* out_len, int* is_keyframe, int* pts_out);
+void vnc_vp9_encoder_destroy(void* enc_ptr);
+void vnc_vp9_encoder_force_keyframe(void* enc_ptr);
 
 // --- UDP H.264 transport interface (src/leanrfb_udp.c) ---
 

@@ -781,6 +781,9 @@ static void vnc_client_disconnect(vnc_server_t* server, vnc_client_t* client) {
     if (client->h264_enc) {
         vnc_h264_encoder_destroy(client->h264_enc);
     }
+    if (client->vp9_enc) {
+        vnc_vp9_encoder_destroy(client->vp9_enc);
+    }
     free(client->dirty_tiles);
     memset(client->udp_key, 0, sizeof(client->udp_key)); // don't leave session key material in freed heap memory
     free(client);
@@ -1096,6 +1099,7 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                 client->supports_tight = 0;
                 client->supports_rich_cursor = 0;
                 client->supports_h264 = 0;
+                client->supports_vp9 = 0;
                 client->supports_udp = 0;
                 printf("[VNC SERVER] Client supports encodings: ");
                 for (int i = 0; i < num_encodings; i++) {
@@ -1107,6 +1111,8 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                         client->supports_tight = 1;
                     } else if (enc == 50) {
                         client->supports_h264 = 1;
+                    } else if (enc == VNC_ENCODING_VP9) {
+                        client->supports_vp9 = 1;
                     } else if (enc == VNC_ENCODING_UDP_SETUP) {
                         client->supports_udp = 1;
                     } else if (enc == -239) {
@@ -1181,6 +1187,149 @@ disconnect:
     vnc_client_disconnect(server, client);
 }
 
+// Function-pointer table describing one video codec's encoder, so the UDP/TCP dispatch
+// logic below (identical for every codec) only needs to be written once. See
+// src/leanrfb_h264.c / src/leanrfb_vp9.c for the concrete implementations.
+typedef struct {
+    void* (*create)(int width, int height, int fps, int quality);
+    int (*encode)(void* enc, const uint32_t* fb, uint8_t** out_data, int* out_len, int* is_keyframe, int* pts_out);
+    void (*destroy)(void* enc);
+    void (*force_keyframe)(void* enc);
+    uint32_t rfb_encoding;  // TCP rectangle encoding id (50 = H.264, VNC_ENCODING_VP9 = VP9)
+    uint8_t udp_codec_id;   // codec byte sent in the UDP setup payload (VNC_UDP_CODEC_*)
+} vnc_video_ops_t;
+
+static const vnc_video_ops_t vnc_h264_ops = {
+    vnc_h264_encoder_create, vnc_h264_encoder_encode, vnc_h264_encoder_destroy,
+    vnc_h264_encoder_force_keyframe, 50, VNC_UDP_CODEC_H264
+};
+
+static const vnc_video_ops_t vnc_vp9_ops = {
+    vnc_vp9_encoder_create, vnc_vp9_encoder_encode, vnc_vp9_encoder_destroy,
+    vnc_vp9_encoder_force_keyframe, VNC_ENCODING_VP9, VNC_UDP_CODEC_VP9
+};
+
+// Encode (lazily creating the encoder on first use) and deliver one video frame to a
+// client, over UDP if that transport is live for this client, else over TCP. Handles the
+// one-time UDP setup handshake and force-keyframe requests. `enc_slot` is the address of
+// whichever of client->h264_enc / client->vp9_enc corresponds to `ops`.
+static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
+                                  void** enc_slot, const vnc_video_ops_t* ops) {
+    int has_dirty = 0;
+    for (int i = 0; i < server->cols * server->rows; i++) {
+        if (client->dirty_tiles[i]) {
+            has_dirty = 1;
+            break;
+        }
+    }
+    if (!has_dirty) {
+        return;
+    }
+
+    if (!*enc_slot) {
+        *enc_slot = ops->create(server->width, server->height, 30, 80);
+        if (!*enc_slot) return;
+    }
+
+    // One-time handshake: hand the client a fresh random key + connection id for the
+    // encrypted UDP transport over the already-authenticated TCP control channel.
+    // See docs/custom/rfb_h264_udp_extension.md.
+    if (client->supports_udp && !client->udp_setup_sent && server->udp_fd >= 0) {
+        uint8_t key[VNC_UDP_KEY_LEN];
+        uint8_t cid[VNC_UDP_CID_LEN];
+        if (secure_random_bytes(key, sizeof(key)) == 0 && secure_random_bytes(cid, sizeof(cid)) == 0) {
+            memcpy(client->udp_key, key, sizeof(key));
+            memcpy(client->udp_cid, cid, sizeof(cid));
+            client->udp_ready = 0;
+            client->udp_send_ctr = 0;
+            client->udp_frame_id = 0;
+            client->udp_recv_replay.highest = 0;
+            client->udp_recv_replay.bitmap = 0;
+
+            struct sockaddr_in local_addr;
+            socklen_t local_len = sizeof(local_addr);
+            uint16_t udp_port = 0;
+            if (getsockname(server->udp_fd, (struct sockaddr*)&local_addr, &local_len) == 0) {
+                udp_port = ntohs(local_addr.sin_port);
+            }
+
+            uint8_t setup_payload[2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN + 1];
+            write_u16_be(setup_payload, udp_port);
+            memcpy(setup_payload + 2, cid, VNC_UDP_CID_LEN);
+            memcpy(setup_payload + 2 + VNC_UDP_CID_LEN, key, VNC_UDP_KEY_LEN);
+            setup_payload[2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN] = ops->udp_codec_id;
+
+            uint8_t header[4] = {0, 0, 0, 1};
+            uint8_t r_header[12];
+            write_u16_be(r_header + 0, 0);
+            write_u16_be(r_header + 2, 0);
+            write_u16_be(r_header + 4, server->width);
+            write_u16_be(r_header + 6, server->height);
+            write_u32_be(r_header + 8, VNC_ENCODING_UDP_SETUP);
+
+            if (client_buf_append(client, header, 4) == 0 &&
+                client_buf_append(client, r_header, 12) == 0 &&
+                client_buf_append(client, setup_payload, sizeof(setup_payload)) == 0) {
+                client->udp_setup_sent = 1;
+                vnc_client_flush(client);
+            }
+        }
+    }
+
+    int requested_reset = client->force_keyframe_requested;
+    if (requested_reset) {
+        ops->force_keyframe(*enc_slot);
+        client->force_keyframe_requested = 0;
+    }
+
+    uint8_t* video_data = NULL;
+    int video_len = 0;
+    int is_key = 0;
+    int pts = 0;
+    if (ops->encode(*enc_slot, server->framebuffer, &video_data, &video_len, &is_key, &pts) == 0 && video_len > 0) {
+        uint32_t flags = 0;
+        if (is_key && (pts == 1 || requested_reset)) {
+            flags = 2;
+        }
+
+        int udp_active = client->supports_udp && client->udp_ready && server->udp_fd >= 0 &&
+                         (get_time_ms() - client->udp_last_recv_ms < VNC_UDP_LIVENESS_TIMEOUT_MS);
+
+        if (udp_active && vnc_udp_send_video_frame(server, client, video_data, video_len, (int)flags) == 0) {
+            memset(client->dirty_tiles, 0, (size_t)server->cols * server->rows);
+            client->update_requested = 0;
+            return;
+        }
+
+        // TCP fallback: UDP not (yet) negotiated/live for this client, or the frame
+        // was too large to fragment over UDP.
+        uint8_t header[4];
+        header[0] = 0;
+        header[1] = 0;
+        write_u16_be(header + 2, 1);
+        if (client_buf_append(client, header, 4) < 0) return;
+
+        uint8_t r_header[12];
+        write_u16_be(r_header + 0, 0);
+        write_u16_be(r_header + 2, 0);
+        write_u16_be(r_header + 4, server->width);
+        write_u16_be(r_header + 6, server->height);
+        write_u32_be(r_header + 8, ops->rfb_encoding);
+        if (client_buf_append(client, r_header, 12) < 0) return;
+
+        uint8_t p_header[8];
+        write_u32_be(p_header + 0, (uint32_t)video_len);
+        write_u32_be(p_header + 4, flags);
+
+        if (client_buf_append(client, p_header, 8) < 0) return;
+        if (client_buf_append(client, video_data, video_len) < 0) return;
+
+        memset(client->dirty_tiles, 0, (size_t)server->cols * server->rows);
+        client->update_requested = 0;
+        vnc_client_flush(client);
+    }
+}
+
 static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client) {
     if (client->write_len > client->write_pos) return;
 
@@ -1246,118 +1395,11 @@ static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client) {
     }
 
     if (client->supports_h264) {
-        int has_dirty = 0;
-        for (int i = 0; i < server->cols * server->rows; i++) {
-            if (client->dirty_tiles[i]) {
-                has_dirty = 1;
-                break;
-            }
-        }
-        if (!has_dirty) {
-            return;
-        }
-
-        if (!client->h264_enc) {
-            client->h264_enc = vnc_h264_encoder_create(server->width, server->height, 30, 80);
-            if (!client->h264_enc) return;
-        }
-
-        // One-time handshake: hand the client a fresh random key + connection id for the
-        // encrypted UDP transport over the already-authenticated TCP control channel.
-        // See docs/custom/rfb_h264_udp_extension.md.
-        if (client->supports_udp && !client->udp_setup_sent && server->udp_fd >= 0) {
-            uint8_t key[VNC_UDP_KEY_LEN];
-            uint8_t cid[VNC_UDP_CID_LEN];
-            if (secure_random_bytes(key, sizeof(key)) == 0 && secure_random_bytes(cid, sizeof(cid)) == 0) {
-                memcpy(client->udp_key, key, sizeof(key));
-                memcpy(client->udp_cid, cid, sizeof(cid));
-                client->udp_ready = 0;
-                client->udp_send_ctr = 0;
-                client->udp_frame_id = 0;
-                client->udp_recv_replay.highest = 0;
-                client->udp_recv_replay.bitmap = 0;
-
-                struct sockaddr_in local_addr;
-                socklen_t local_len = sizeof(local_addr);
-                uint16_t udp_port = 0;
-                if (getsockname(server->udp_fd, (struct sockaddr*)&local_addr, &local_len) == 0) {
-                    udp_port = ntohs(local_addr.sin_port);
-                }
-
-                uint8_t setup_payload[2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN];
-                write_u16_be(setup_payload, udp_port);
-                memcpy(setup_payload + 2, cid, VNC_UDP_CID_LEN);
-                memcpy(setup_payload + 2 + VNC_UDP_CID_LEN, key, VNC_UDP_KEY_LEN);
-
-                uint8_t header[4] = {0, 0, 0, 1};
-                uint8_t r_header[12];
-                write_u16_be(r_header + 0, 0);
-                write_u16_be(r_header + 2, 0);
-                write_u16_be(r_header + 4, server->width);
-                write_u16_be(r_header + 6, server->height);
-                write_u32_be(r_header + 8, VNC_ENCODING_UDP_SETUP);
-
-                if (client_buf_append(client, header, 4) == 0 &&
-                    client_buf_append(client, r_header, 12) == 0 &&
-                    client_buf_append(client, setup_payload, sizeof(setup_payload)) == 0) {
-                    client->udp_setup_sent = 1;
-                    vnc_client_flush(client);
-                }
-            }
-        }
-
-        int requested_reset = client->force_keyframe_requested;
-        if (requested_reset) {
-            vnc_h264_encoder_force_keyframe(client->h264_enc);
-            client->force_keyframe_requested = 0;
-        }
-
-        uint8_t* h264_data = NULL;
-        int h264_len = 0;
-        int is_key = 0;
-        int pts = 0;
-        if (vnc_h264_encoder_encode(client->h264_enc, server->framebuffer, &h264_data, &h264_len, &is_key, &pts) == 0 && h264_len > 0) {
-            uint32_t flags = 0;
-            if (is_key && (pts == 1 || requested_reset)) {
-                flags = 2;
-            }
-
-            int udp_active = client->supports_udp && client->udp_ready && server->udp_fd >= 0 &&
-                             (get_time_ms() - client->udp_last_recv_ms < VNC_UDP_LIVENESS_TIMEOUT_MS);
-
-            if (udp_active && vnc_udp_send_video_frame(server, client, h264_data, h264_len, (int)flags) == 0) {
-                memset(client->dirty_tiles, 0, (size_t)server->cols * server->rows);
-                client->update_requested = 0;
-                return;
-            }
-
-            // TCP fallback: UDP not (yet) negotiated/live for this client, or the frame
-            // was too large to fragment over UDP.
-            uint8_t header[4];
-            header[0] = 0;
-            header[1] = 0;
-            write_u16_be(header + 2, 1);
-            if (client_buf_append(client, header, 4) < 0) return;
-
-            uint8_t r_header[12];
-            write_u16_be(r_header + 0, 0);
-            write_u16_be(r_header + 2, 0);
-            write_u16_be(r_header + 4, server->width);
-            write_u16_be(r_header + 6, server->height);
-            write_u32_be(r_header + 8, 50);
-            if (client_buf_append(client, r_header, 12) < 0) return;
-
-            uint8_t p_header[8];
-            write_u32_be(p_header + 0, (uint32_t)h264_len);
-            write_u32_be(p_header + 4, flags);
-
-            if (client_buf_append(client, p_header, 8) < 0) return;
-            if (client_buf_append(client, h264_data, h264_len) < 0) return;
-
-            memset(client->dirty_tiles, 0, (size_t)server->cols * server->rows);
-            client->update_requested = 0;
-            vnc_client_flush(client);
-        }
+        vnc_send_video_update(server, client, &client->h264_enc, &vnc_h264_ops);
+        return;
+    }
+    if (client->supports_vp9) {
+        vnc_send_video_update(server, client, &client->vp9_enc, &vnc_vp9_ops);
         return;
     }
 

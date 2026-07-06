@@ -64,7 +64,12 @@ static inline uint32_t read_u32_be(const uint8_t *buf) {
 // FramebufferUpdateRequest (that only happens after a frame is decoded+drawn) and the whole
 // exchange would deadlock permanently on a single dropped datagram.
 #define VNC_UDP_REASM_TIMEOUT_MS 400
-#define VNC_UDP_SETUP_PAYLOAD_LEN (2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN)
+// Codec byte appended to the UDP setup payload so the client knows which decoder to
+// instantiate for this session regardless of transport (see leanrfb_internal.h).
+#define VNC_UDP_CODEC_H264 0
+#define VNC_UDP_CODEC_VP9 1
+#define VNC_UDP_SETUP_PAYLOAD_LEN (2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN + 1)
+#define VNC_ENCODING_VP9 52
 #define VNC_MSG_REQUEST_KEYFRAME 254
 
 typedef struct {
@@ -291,6 +296,10 @@ static AVFrame* sw_frame = NULL;
 static enum AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
 static enum AVPixelFormat last_format = AV_PIX_FMT_NONE;
 static enum AVPixelFormat expected_hw_pix_fmt = AV_PIX_FMT_NONE;
+// Which codec init_decoder()/decode_video() should use — set from whichever encoding
+// (TCP rect 50/52, or the UDP setup codec byte) the server actually negotiated, so this
+// never depends on guessing from our own dropdown selection.
+static enum AVCodecID active_video_codec_id = AV_CODEC_ID_H264;
 
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
     (void)ctx;
@@ -306,9 +315,10 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelF
 }
 
 static void init_decoder(int width, int height) {
-    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    const AVCodec* codec = avcodec_find_decoder(active_video_codec_id);
     if (!codec) {
-        fprintf(stderr, "Error: H.264 decoder not found in libavcodec\n");
+        fprintf(stderr, "Error: %s decoder not found in libavcodec\n",
+                active_video_codec_id == AV_CODEC_ID_VP9 ? "VP9" : "H.264");
         return;
     }
     codec_ctx = avcodec_alloc_context3(codec);
@@ -346,7 +356,8 @@ static void init_decoder(int width, int height) {
     av_dict_set(&opts, "tune", "zerolatency", 0);
     
     if (avcodec_open2(codec_ctx, codec, &opts) < 0) {
-        fprintf(stderr, "Error: Could not open libavcodec H.264 decoder\n");
+        fprintf(stderr, "Error: Could not open libavcodec %s decoder\n",
+                active_video_codec_id == AV_CODEC_ID_VP9 ? "VP9" : "H.264");
     }
     av_dict_free(&opts);
 
@@ -387,7 +398,7 @@ static void reset_decoder(int width, int height) {
     init_decoder(width, height);
 }
 
-static int decode_h264(const uint8_t* data, int len, uint8_t* out_bgra, int width, int height) {
+static int decode_video(const uint8_t* data, int len, uint8_t* out_bgra, int width, int height) {
     if (!codec_ctx) {
         init_decoder(width, height);
         if (!codec_ctx) return -1;
@@ -704,6 +715,8 @@ static void udp_handle_setup(const uint8_t* payload) {
     uint16_t port = read_u16_be(payload);
     memcpy(udp_cid, payload + 2, VNC_UDP_CID_LEN);
     memcpy(udp_key, payload + 2 + VNC_UDP_CID_LEN, VNC_UDP_KEY_LEN);
+    uint8_t codec_byte = payload[2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN];
+    active_video_codec_id = (codec_byte == VNC_UDP_CODEC_VP9) ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
 
     if (udp_fd < 0) {
         udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -794,7 +807,7 @@ static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
             reset_decoder(screen_w, screen_h);
         }
         if (total_len > 0) {
-            decode_h264(reasm_buf, (int)total_len, backbuffer, screen_w, screen_h);
+            decode_video(reasm_buf, (int)total_len, backbuffer, screen_w, screen_h);
         }
 
         have_last_completed_frame = 1;
@@ -862,6 +875,11 @@ static void* vnc_client_thread(void* arg) {
     int num_encs = 0;
     if (strcmp(preferred_encoding, "h264") == 0) {
         write_u32_be(encs_msg + 4 + (num_encs++) * 4, 50); // H.264
+        write_u32_be(encs_msg + 4 + (num_encs++) * 4, VNC_ENCODING_UDP_SETUP); // opt into the UDP transport
+        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 7);  // Tight (JPEG)
+        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 5);  // Hextile
+    } else if (strcmp(preferred_encoding, "vp9") == 0) {
+        write_u32_be(encs_msg + 4 + (num_encs++) * 4, VNC_ENCODING_VP9); // VP9
         write_u32_be(encs_msg + 4 + (num_encs++) * 4, VNC_ENCODING_UDP_SETUP); // opt into the UDP transport
         write_u32_be(encs_msg + 4 + (num_encs++) * 4, 7);  // Tight (JPEG)
         write_u32_be(encs_msg + 4 + (num_encs++) * 4, 5);  // Hextile
@@ -978,7 +996,8 @@ static void* vnc_client_thread(void* arg) {
                     decode_jpeg(jpeg_data, jpeg_size, backbuffer, rx, ry, rw, rh, w);
                     free(jpeg_data);
                 }
-                else if (encoding == 50) { // H.264
+                else if (encoding == 50 || encoding == VNC_ENCODING_VP9) { // H.264 / VP9
+                    active_video_codec_id = (encoding == VNC_ENCODING_VP9) ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
                     uint32_t length = 0;
                     uint32_t flags = 0;
                     if (read_exact(fd, &length, 4) < 0 || read_exact(fd, &flags, 4) < 0) goto exit_thread;
@@ -996,7 +1015,7 @@ static void* vnc_client_thread(void* arg) {
                     }
 
                     if (length > 0) {
-                        decode_h264(payload, length, backbuffer, w, h);
+                        decode_video(payload, length, backbuffer, w, h);
                     }
                     free(payload);
                 }
@@ -1148,8 +1167,9 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     // Parse preferred encoding option
     int enc_active = gtk_combo_box_get_active(GTK_COMBO_BOX(combo_encoding));
     if (enc_active == 0) strcpy(preferred_encoding, "h264");
-    else if (enc_active == 1) strcpy(preferred_encoding, "jpeg");
-    else if (enc_active == 2) strcpy(preferred_encoding, "hextile");
+    else if (enc_active == 1) strcpy(preferred_encoding, "vp9");
+    else if (enc_active == 2) strcpy(preferred_encoding, "jpeg");
+    else if (enc_active == 3) strcpy(preferred_encoding, "hextile");
     else strcpy(preferred_encoding, "raw");
 
     // Perform socket connection
@@ -1410,6 +1430,7 @@ int main(int argc, char* argv[]) {
 
     combo_encoding = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "H.264 Video (Zero Latency)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "VP9 Video (Zero Latency)");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Tight JPEG (Medium Bandwidth)");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Hextile (Low CPU)");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Raw (Local Connection)");

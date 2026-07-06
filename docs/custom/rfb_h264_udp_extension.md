@@ -1,10 +1,14 @@
-# Encrypted UDP Transport for H.264 (Open UDP Video Extension)
+# Encrypted UDP Transport for Video (Open UDP Video Extension)
 
 This document specifies an optional, encrypted UDP side-channel for delivering the
-[Open H.264 Encoding](rfb_h264_extension.md) video stream with lower and more consistent
-latency than TCP — the goal is smooth, responsive, gaming-like interactive performance.
-It is a companion extension to encoding `50` and does not change how H.264 itself is
-encoded; it only changes how the encoded bytes get from server to client.
+[Open H.264](rfb_h264_extension.md) or [Open VP9](rfb_vp9_extension.md) video stream
+with lower and more consistent latency than TCP — the goal is smooth, responsive,
+gaming-like interactive performance. It is a companion extension to encodings `50`
+(H.264) and `52` (VP9) and does not change how either codec itself is encoded; it only
+changes how the encoded bytes get from server to client. The transport itself is fully
+codec-agnostic — it moves an opaque, already-encoded byte blob per frame — so the same
+mechanism covers both codecs, distinguished only by a one-byte codec id sent once at
+setup time (§3).
 
 TCP forces every frame update to wait for retransmission of any earlier lost segment
 before later data can be processed ("head-of-line blocking"), which under real-world
@@ -19,19 +23,19 @@ head-of-line blocking.
 ## 1. Design summary
 
 - The existing TCP RFB connection remains the control channel for the entire session:
-  handshake, authentication, input events, clipboard, and (as a fallback) H.264 video
-  itself all continue to work exactly as before. UDP is strictly additive.
+  handshake, authentication, input events, clipboard, and (as a fallback) video itself
+  all continue to work exactly as before. UDP is strictly additive.
 - Once negotiated, the server hands the client a fresh, random, single-use AES-256-GCM
   key and connection id over the *already-authenticated* TCP connection. Every UDP
   datagram is authenticated-encrypted with that key, so an attacker who does not have
   the key cannot inject, replay, or read frames, even though UDP itself has no
   connection state.
-- Each encoded H.264 frame is fragmented into small datagrams and reassembled by the
-  client. If any fragment is lost, at worst one video frame is skipped — the decoder
-  self-heals via the encoder's existing periodic keyframes, and the client can also
-  proactively request an immediate keyframe when it detects loss.
+- Each encoded video frame (H.264 or VP9) is fragmented into small datagrams and
+  reassembled by the client. If any fragment is lost, at worst one video frame is
+  skipped — the decoder self-heals via the encoder's existing periodic keyframes, and
+  the client can also proactively request an immediate keyframe when it detects loss.
 - If the client's network can't do UDP at all (symmetric NAT that never opens, UDP
-  blocked by a firewall, etc.), the server automatically continues delivering H.264 over
+  blocked by a firewall, etc.), the server automatically continues delivering video over
   TCP for that client, exactly as it did before this extension existed. UDP is only ever
   used once the transport has actually proven itself live.
 
@@ -41,14 +45,17 @@ A new pseudo-encoding is introduced:
 
 - **UDP Transport Setup encoding ID: `51`**
 
-A client that wants the UDP transport advertises both `50` (H.264) and `51` in its
-`SetEncodings` message. If the server also supports UDP (see §7) and sees both, it will,
-the first time it has H.264 data to send to that client, send a one-time **setup
-message** and thereafter attempt UDP delivery for that client's video.
+A client that wants the UDP transport advertises both a video codec (`50` for H.264, or
+`52` for VP9) and `51` in its `SetEncodings` message. If the server also supports UDP
+(see §7) and sees both, it will, the first time it has video data to send to that
+client, send a one-time **setup message** and thereafter attempt UDP delivery for that
+client's video, using whichever codec was negotiated.
 
-Advertising `51` without `50` has no effect. A server or client that does not recognize
-`51` simply ignores it, per normal RFB pseudo-encoding rules — the connection continues
-to work over TCP exactly as it does today.
+Advertising `51` without a video codec has no effect. A server or client that does not
+recognize `51` simply ignores it, per normal RFB pseudo-encoding rules — the connection
+continues to work over TCP exactly as it does today. This server implementation only
+ever runs one video codec per client (it prefers H.264 if a client oddly advertises both
+`50` and `52`); the UDP transport itself doesn't care which one it is carrying.
 
 ## 3. Setup message
 
@@ -59,13 +66,14 @@ control channel (the same mechanism the H.264 extension itself uses), with:
 - **Width/Height**: framebuffer width/height (unused, present for header uniformity)
 - **Encoding-type**: `51` (UDP Transport Setup)
 
-The rectangle payload (42 bytes, no length prefix — the size is fixed) is:
+The rectangle payload (43 bytes, no length prefix — the size is fixed) is:
 
 | Field | Size | Description |
 |---|---|---|
 | `udp_port` | 2 bytes (`uint16_t`, BE) | UDP port the server is listening on |
 | `cid` | 8 bytes | Random connection id for this UDP session |
 | `key` | 32 bytes | Random AES-256-GCM key for this UDP session |
+| `codec` | 1 byte | `0` = H.264, `1` = VP9 — tells the client which decoder to instantiate for the video that will arrive over this UDP session (and for any TCP-fallback rectangles using the same codec), independent of which encoding number happened to be negotiated |
 
 The server binds its UDP socket to the **same port number** as the TCP listener (UDP and
 TCP occupy independent namespaces, so no additional port needs to be opened through a
@@ -119,8 +127,9 @@ GCM's security.
 [frame_id:4][frag_idx:2][frag_count:2][flags:1][reserved:1][fragment bytes...]
 ```
 
-- `frame_id`: monotonically increasing counter, one per H.264 frame sent over UDP
-  (independent of the AEAD `counter`, which increases per *datagram*, i.e. per fragment).
+- `frame_id`: monotonically increasing counter, one per video frame (H.264 or VP9) sent
+  over UDP (independent of the AEAD `counter`, which increases per *datagram*, i.e. per
+  fragment).
 - `frag_idx` / `frag_count`: this fragment's index and the total number of fragments the
   frame was split into (fragments are `VNC_UDP_MAX_FRAG_PAYLOAD` = 1200 bytes each except
   the last, which is at most 1200 bytes).
@@ -199,8 +208,10 @@ stream — this extension avoids that outcome:
 ## 8. Server configuration
 
 `vnc_server_config_t.disable_udp_h264` (see `include/leanrfb.h`) controls whether the
-server offers this transport at all; it defaults to enabled (`0`). Set it to `1` to
-force H.264 video over TCP only, e.g. on networks where UDP is blocked or filtered.
+server offers this transport at all, for either codec — the field predates VP9 support
+and its name wasn't changed to avoid an unnecessary API break, but it applies uniformly.
+It defaults to enabled (`0`). Set it to `1` to force video over TCP only, e.g. on
+networks where UDP is blocked or filtered.
 
 For `x11_vnc_server`, this is exposed in `x11_vnc_server.conf` as:
 
@@ -209,7 +220,7 @@ enable_udp=y   # or n to disable
 ```
 
 Disabling it costs nothing for clients that don't ask for `51` in the first place, and
-clients that do ask will simply keep receiving H.264 over TCP, unchanged from before this
+clients that do ask will simply keep receiving video over TCP, unchanged from before this
 extension existed.
 
 ## 9. Threat model summary
