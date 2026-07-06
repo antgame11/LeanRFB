@@ -206,6 +206,7 @@ static unsigned long long get_time_ms(void) {
 // 0 (leaving *out_w/*out_h untouched) if the output has no usable modes or the switch
 // failed.
 static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req_w, int req_h, int* out_w, int* out_h) {
+    (void)screen_num;
     XRRScreenResources* res = XRRGetScreenResources(dpy, root);
     if (!res) return 0;
 
@@ -245,8 +246,8 @@ static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req
             int min_w, min_h, max_w, max_h;
             XRRGetScreenSizeRange(dpy, root, &min_w, &min_h, &max_w, &max_h);
 
-            int cur_w = DisplayWidth(dpy, screen_num);
-            int cur_h = DisplayHeight(dpy, screen_num);
+            int cur_w = (int)crtc_info->width;
+            int cur_h = (int)crtc_info->height;
             int grown_w = best_w > cur_w ? best_w : cur_w;
             int grown_h = best_h > cur_h ? best_h : cur_h;
             if (grown_w > max_w) grown_w = max_w;
@@ -263,8 +264,8 @@ static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req
                 // (best-effort; harmless no-op if it's already that size).
                 XRRSetScreenSize(dpy, root, best_w, best_h, out_info->mm_width, out_info->mm_height);
                 XSync(dpy, False);
-                *out_w = DisplayWidth(dpy, screen_num);
-                *out_h = DisplayHeight(dpy, screen_num);
+                *out_w = best_w;
+                *out_h = best_h;
                 applied = 1;
             }
             XRRFreeCrtcInfo(crtc_info);
