@@ -21,6 +21,17 @@
 #include <libavutil/imgutils.h>
 #include <time.h>
 
+// Non-essential diagnostic logging (connection lifecycle, encoding negotiation, UDP
+// transport handshake/reassembly, decoder state). Silent by default; build with
+// `make vncviewer DEBUG=1` (defines VNC_DEBUG) to see it on stderr. Genuine, unexpected
+// failures (a decoder that can't be opened, a socket that unexpectedly closes, etc.)
+// are still reported unconditionally via fprintf/show_error_dialog regardless of this.
+#ifdef VNC_DEBUG
+#define DEBUG_LOG(fmt, ...) fprintf(stderr, "[VNCVIEW DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+#define DEBUG_LOG(fmt, ...) do {} while (0)
+#endif
+
 // Standard VNC macros
 #define write_u16_be(buf, val) do { \
     (buf)[0] = (uint8_t)((val) >> 8); \
@@ -300,6 +311,13 @@ static enum AVPixelFormat expected_hw_pix_fmt = AV_PIX_FMT_NONE;
 // (TCP rect 50/52, or the UDP setup codec byte) the server actually negotiated, so this
 // never depends on guessing from our own dropdown selection.
 static enum AVCodecID active_video_codec_id = AV_CODEC_ID_H264;
+// The server only guarantees a frame is self-decodable (carries its own SPS/PPS, no
+// dependency on prior frames) on the specific frame it marks with the resetAllContextsFlag
+// (flags bit 0x02) — decode_video()'s own lazy decoder creation would otherwise try to
+// decode whatever video payload happens to arrive first, which for some encoders (notably
+// hardware encoders like VA-API) is *not* that self-contained frame and fails decode with
+// errors like "non-existing PPS 0 referenced". Drop any payload until we've seen a reset.
+static int decoder_primed = 0;
 
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
     (void)ctx;
@@ -321,11 +339,13 @@ static void init_decoder(int width, int height) {
                 active_video_codec_id == AV_CODEC_ID_VP9 ? "VP9" : "H.264");
         return;
     }
+    DEBUG_LOG("init_decoder: codec=%s %dx%d",
+              active_video_codec_id == AV_CODEC_ID_VP9 ? "VP9" : "H.264", width, height);
     codec_ctx = avcodec_alloc_context3(codec);
     codec_ctx->width = width;
     codec_ctx->height = height;
     codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    
+
     codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
     codec_ctx->thread_count = 0;
@@ -337,7 +357,7 @@ static void init_decoder(int width, int height) {
         codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
         codec_ctx->get_format = get_hw_format;
         expected_hw_pix_fmt = AV_PIX_FMT_VAAPI;
-        printf("[VNCVIEW] GPU VA-API Hardware Decoding enabled successfully.\n");
+        DEBUG_LOG("GPU VA-API Hardware Decoding enabled successfully.");
     } else {
         // Try GPU CUDA (Nvidia)
         ret = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0);
@@ -345,16 +365,16 @@ static void init_decoder(int width, int height) {
             codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
             codec_ctx->get_format = get_hw_format;
             expected_hw_pix_fmt = AV_PIX_FMT_CUDA;
-            printf("[VNCVIEW] GPU CUDA Hardware Decoding enabled successfully.\n");
+            DEBUG_LOG("GPU CUDA Hardware Decoding enabled successfully.");
         } else {
             expected_hw_pix_fmt = AV_PIX_FMT_NONE;
-            printf("[VNCVIEW] GPU Hardware Decoding not supported. Falling back to CPU software decoding.\n");
+            DEBUG_LOG("GPU Hardware Decoding not supported. Falling back to CPU software decoding.");
         }
     }
 
     AVDictionary* opts = NULL;
     av_dict_set(&opts, "tune", "zerolatency", 0);
-    
+
     if (avcodec_open2(codec_ctx, codec, &opts) < 0) {
         fprintf(stderr, "Error: Could not open libavcodec %s decoder\n",
                 active_video_codec_id == AV_CODEC_ID_VP9 ? "VP9" : "H.264");
@@ -368,6 +388,7 @@ static void init_decoder(int width, int height) {
 }
 
 static void reset_decoder(int width, int height) {
+    DEBUG_LOG("reset_decoder: discarding decoder state and priming for a fresh keyframe (%dx%d)", width, height);
     if (codec_ctx) {
         avcodec_free_context(&codec_ctx);
         codec_ctx = NULL;
@@ -395,6 +416,7 @@ static void reset_decoder(int width, int height) {
     hw_pix_fmt = AV_PIX_FMT_NONE;
     last_format = AV_PIX_FMT_NONE;
     expected_hw_pix_fmt = AV_PIX_FMT_NONE;
+    decoder_primed = 1;
     init_decoder(width, height);
 }
 
@@ -407,12 +429,16 @@ static int decode_video(const uint8_t* data, int len, uint8_t* out_bgra, int wid
     pkt->size = len;
 
     int ret = avcodec_send_packet(codec_ctx, pkt);
-    if (ret < 0) return -1;
+    if (ret < 0) {
+        DEBUG_LOG("decode_video: avcodec_send_packet failed (ret=%d, len=%d)", ret, len);
+        return -1;
+    }
 
     ret = avcodec_receive_frame(codec_ctx, frame);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
         return 0;
     } else if (ret < 0) {
+        DEBUG_LOG("decode_video: avcodec_receive_frame failed (ret=%d)", ret);
         return -1;
     }
 
@@ -692,6 +718,7 @@ static void request_keyframe(void) {
     if (now - udp_last_keyframe_request_ms < 500) return;
     udp_last_keyframe_request_ms = now;
     if (vnc_fd >= 0) {
+        DEBUG_LOG("request_keyframe: asking server for a fresh IDR");
         uint8_t msg = VNC_MSG_REQUEST_KEYFRAME;
         send(vnc_fd, &msg, 1, 0);
     }
@@ -717,6 +744,10 @@ static void udp_handle_setup(const uint8_t* payload) {
     memcpy(udp_key, payload + 2 + VNC_UDP_CID_LEN, VNC_UDP_KEY_LEN);
     uint8_t codec_byte = payload[2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN];
     active_video_codec_id = (codec_byte == VNC_UDP_CODEC_VP9) ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
+    DEBUG_LOG("udp_handle_setup: server port=%u codec=%s cid=%02x%02x%02x%02x%02x%02x%02x%02x",
+              port, codec_byte == VNC_UDP_CODEC_VP9 ? "VP9" : "H.264",
+              udp_cid[0], udp_cid[1], udp_cid[2], udp_cid[3],
+              udp_cid[4], udp_cid[5], udp_cid[6], udp_cid[7]);
 
     if (udp_fd < 0) {
         udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -780,11 +811,16 @@ static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
         // first frame seen) — dropping the stale partial frame is the right call for
         // latency, but it also means we lost data, so ask for a keyframe to recover.
         if (reasm_active && reasm_frags_got < reasm_frag_count) {
+            DEBUG_LOG("reasm: abandoning frame %u at %u/%u fragments (frame %u arrived early)",
+                      reasm_frame_id, reasm_frags_got, reasm_frag_count, frame_id);
             request_keyframe();
         }
         if (have_last_completed_frame && frame_id != last_completed_frame_id + 1) {
+            DEBUG_LOG("reasm: frame id gap detected (last completed=%u, now=%u) — a whole frame was lost",
+                      last_completed_frame_id, frame_id);
             request_keyframe();
         }
+        DEBUG_LOG("reasm: starting frame %u (%u fragments)", frame_id, frag_count);
         reasm_start(frame_id, frag_count);
     }
     if (!reasm_active || !reasm_buf) return;
@@ -802,11 +838,13 @@ static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
 
     if (reasm_frags_got == reasm_frag_count) {
         size_t total_len = (size_t)(reasm_frag_count - 1) * VNC_UDP_MAX_FRAG_PAYLOAD + reasm_last_frag_len;
+        DEBUG_LOG("reasm: frame %u complete (%u fragments, %zu bytes, flags=0x%02x, primed=%d)",
+                  frame_id, reasm_frag_count, total_len, reasm_flags, decoder_primed);
 
         if (reasm_flags & 2) {
             reset_decoder(screen_w, screen_h);
         }
-        if (total_len > 0) {
+        if (decoder_primed && total_len > 0) {
             decode_video(reasm_buf, (int)total_len, backbuffer, screen_w, screen_h);
         }
 
@@ -837,8 +875,14 @@ static void udp_drain(void) {
         uint8_t type = 0;
         uint64_t counter = 0;
         int pt_len = 0;
-        if (udp_open(udp_key, buf, (int)n, &type, &counter, plaintext, &pt_len) < 0) continue;
-        if (!udp_replay_check(&udp_recv_replay, counter)) continue;
+        if (udp_open(udp_key, buf, (int)n, &type, &counter, plaintext, &pt_len) < 0) {
+            DEBUG_LOG("udp_drain: AEAD authentication failed on a %zd-byte datagram — dropping", n);
+            continue;
+        }
+        if (!udp_replay_check(&udp_recv_replay, counter)) {
+            DEBUG_LOG("udp_drain: replay/out-of-window counter=%llu — dropping", (unsigned long long)counter);
+            continue;
+        }
 
         reasm_add_fragment(plaintext, pt_len);
     }
@@ -853,6 +897,8 @@ static void reasm_check_timeout(void) {
     if (!reasm_active) return;
     if (vv_now_ms() - reasm_start_ms < VNC_UDP_REASM_TIMEOUT_MS) return;
 
+    DEBUG_LOG("reasm: frame %u timed out at %u/%u fragments — abandoning and re-requesting",
+              reasm_frame_id, reasm_frags_got, reasm_frag_count);
     reasm_active = 0;
     request_keyframe();
     if (vnc_fd >= 0) {
@@ -891,7 +937,8 @@ static void* vnc_client_thread(void* arg) {
     }
     write_u32_be(encs_msg + 4 + (num_encs++) * 4, 0); // Raw fallback
     write_u16_be(encs_msg + 2, num_encs);
-    
+
+    DEBUG_LOG("SetEncodings: sending %d encodings (preferred=%s)", num_encs, preferred_encoding);
     send(fd, encs_msg, 4 + (size_t)num_encs * 4, 0);
 
     // Initial frame request
@@ -1014,7 +1061,7 @@ static void* vnc_client_thread(void* arg) {
                         reset_decoder(w, h);
                     }
 
-                    if (length > 0) {
+                    if (decoder_primed && length > 0) {
                         decode_video(payload, length, backbuffer, w, h);
                     }
                     free(payload);
@@ -1035,6 +1082,7 @@ static void* vnc_client_thread(void* arg) {
     }
 
 exit_thread:
+    DEBUG_LOG("vnc_client_thread: exiting (connection closed or fatal read error)");
     client_running = 0;
     vnc_fd = -1;
     close(fd);
@@ -1087,6 +1135,7 @@ static void on_viewer_destroy(void) {
     hw_pix_fmt = AV_PIX_FMT_NONE;
     last_format = AV_PIX_FMT_NONE;
     expected_hw_pix_fmt = AV_PIX_FMT_NONE;
+    decoder_primed = 0;
     viewer_window = NULL;
     gtk_widget_show_all(main_window);
 }
@@ -1171,6 +1220,7 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     else if (enc_active == 2) strcpy(preferred_encoding, "jpeg");
     else if (enc_active == 3) strcpy(preferred_encoding, "hextile");
     else strcpy(preferred_encoding, "raw");
+    DEBUG_LOG("connecting to %s:%d with preferred encoding=%s", host, port, preferred_encoding);
 
     // Perform socket connection
     struct hostent* he = gethostbyname(host);
@@ -1198,6 +1248,7 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
         show_error_dialog(parent, "Failed to connect to VNC server.");
         return;
     }
+    DEBUG_LOG("TCP connect succeeded");
 
     // Clear timeout setting for runtime VNC operations
     tv.tv_sec = 0;
@@ -1212,6 +1263,7 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
         show_error_dialog(parent, "Failed to read VNC protocol version.");
         return;
     }
+    DEBUG_LOG("server protocol version: %.12s", ver);
     send(fd, "RFB 003.008\n", 12, 0);
 
     // 2. Security Handshake
@@ -1247,6 +1299,7 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
         return;
     }
 
+    DEBUG_LOG("security type selected: %d (%s)", selected_sec, selected_sec == 2 ? "VncAuth" : "None");
     send(fd, &selected_sec, 1, 0);
 
     // 3. Authenticate
@@ -1285,6 +1338,7 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
         show_error_dialog(parent, "Authentication failed (Incorrect Password).");
         return;
     }
+    DEBUG_LOG("authentication succeeded");
 
     // 4. ClientInit
     uint8_t shared = 1;
@@ -1312,6 +1366,8 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
         show_error_dialog(parent, "Failed to read VNC server desktop name.");
         return;
     }
+    server_name[name_len] = '\0';
+    DEBUG_LOG("ServerInit: %ux%u name=\"%s\"", w, h, server_name);
     free(server_name);
 
     vnc_fd = fd;

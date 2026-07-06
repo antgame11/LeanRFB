@@ -5,6 +5,14 @@ X11_LDFLAGS = -lX11 -lXext -lXtst -lXfixes
 CLIENT_CFLAGS = $(shell pkg-config --cflags gtk+-3.0)
 CLIENT_LDFLAGS = $(shell pkg-config --libs gtk+-3.0) -lavcodec -lswscale -lavutil -ljpeg -lcrypto -lpthread
 
+# Non-essential vncviewer diagnostic logging (connection lifecycle, encoding negotiation,
+# UDP transport handshake/reassembly, decoder state) is compiled out by default. Build
+# with `make clean && make vncviewer DEBUG=1` to enable it on stderr — object files
+# aren't tracked per-flag, so a clean rebuild is needed when toggling this.
+ifdef DEBUG
+CLIENT_CFLAGS += -DVNC_DEBUG
+endif
+
 LIB_OBJS = src/leanrfb.o src/leanrfb_hextile.o src/leanrfb_jpeg.o src/leanrfb_h264.o src/leanrfb_vp9.o src/leanrfb_udp.o
 LIB_NAME = libleanrfb.a
 

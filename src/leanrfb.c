@@ -1276,8 +1276,7 @@ static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
         }
     }
 
-    int requested_reset = client->force_keyframe_requested;
-    if (requested_reset) {
+    if (client->force_keyframe_requested) {
         ops->force_keyframe(*enc_slot);
         client->force_keyframe_requested = 0;
     }
@@ -1287,10 +1286,15 @@ static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
     int is_key = 0;
     int pts = 0;
     if (ops->encode(*enc_slot, server->framebuffer, &video_data, &video_len, &is_key, &pts) == 0 && video_len > 0) {
-        uint32_t flags = 0;
-        if (is_key && (pts == 1 || requested_reset)) {
-            flags = 2;
-        }
+        // Any keyframe the encoder actually emits is by definition self-contained (no
+        // dependency on prior frames) and safe to reset the client's decoder onto. This
+        // used to instead check `pts == 1` as a proxy for "the first real output packet,
+        // assuming exactly one frame of encoder lookahead latency" — but encoder lookahead
+        // varies (0, 1, or more frames depending on codec/backend), so that heuristic
+        // could miss the frame that was actually the true first keyframe, leaving the
+        // client's decoder permanently unprimed (a black screen) until the next GOP
+        // boundary keyframe, sometimes seconds later.
+        uint32_t flags = is_key ? 2 : 0;
 
         int udp_active = client->supports_udp && client->udp_ready && server->udp_fd >= 0 &&
                          (get_time_ms() - client->udp_last_recv_ms < VNC_UDP_LIVENESS_TIMEOUT_MS);
