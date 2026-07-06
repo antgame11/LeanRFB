@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <X11/extensions/Xfixes.h>
 #include <unistd.h>
 #include <sys/ipc.h>
@@ -12,6 +13,7 @@
 #include <X11/keysym.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/XTest.h>
+#include <X11/extensions/Xrandr.h>
 
 typedef struct {
     Display* dpy;
@@ -115,6 +117,89 @@ static unsigned long long get_time_ms(void) {
     return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+// Attempt to switch the X display's first connected output to an existing mode that's
+// exactly req_w x req_h via XRandR (the same mechanism `xrandr --output ... --mode WxH`
+// uses). This only selects among modes the driver already advertises — it does not
+// synthesize a new modeline — so it works well for common resolutions real drivers/VMs
+// already list, but an uncommon custom size may not be available.
+//
+// Assumes a single-output setup (typical for a shared VNC desktop/VM): the screen
+// bounding box is grown before the mode switch (required for it to fit) and then shrunk
+// to match afterward. On a real multi-monitor host this could clip other outputs, so
+// this is intentionally scoped to the common single-display case.
+//
+// Returns 1 and sets *out_w/*out_h to the resolution actually applied on success; returns
+// 0 (leaving *out_w/*out_h untouched) if no matching mode was found or the switch failed.
+static int x11_set_resolution(Display* dpy, Window root, int screen_num, int req_w, int req_h, int* out_w, int* out_h) {
+    XRRScreenResources* res = XRRGetScreenResources(dpy, root);
+    if (!res) return 0;
+
+    int applied = 0;
+    for (int oi = 0; oi < res->noutput && !applied; oi++) {
+        XRROutputInfo* out_info = XRRGetOutputInfo(dpy, res, res->outputs[oi]);
+        if (!out_info) continue;
+        if (out_info->connection != RR_Connected || out_info->crtc == 0) {
+            XRRFreeOutputInfo(out_info);
+            continue;
+        }
+
+        RRMode found_mode = 0;
+        for (int mi = 0; mi < out_info->nmode && !found_mode; mi++) {
+            for (int r = 0; r < res->nmode; r++) {
+                if (res->modes[r].id == out_info->modes[mi] &&
+                    (int)res->modes[r].width == req_w && (int)res->modes[r].height == req_h) {
+                    found_mode = res->modes[r].id;
+                    break;
+                }
+            }
+        }
+        if (!found_mode) {
+            XRRFreeOutputInfo(out_info);
+            continue;
+        }
+
+        XRRCrtcInfo* crtc_info = XRRGetCrtcInfo(dpy, res, out_info->crtc);
+        if (crtc_info) {
+            int min_w, min_h, max_w, max_h;
+            XRRGetScreenSizeRange(dpy, root, &min_w, &min_h, &max_w, &max_h);
+
+            int cur_w = DisplayWidth(dpy, screen_num);
+            int cur_h = DisplayHeight(dpy, screen_num);
+            int grown_w = req_w > cur_w ? req_w : cur_w;
+            int grown_h = req_h > cur_h ? req_h : cur_h;
+            if (grown_w > max_w) grown_w = max_w;
+            if (grown_h > max_h) grown_h = max_h;
+            if (grown_w != cur_w || grown_h != cur_h) {
+                XRRSetScreenSize(dpy, root, grown_w, grown_h, out_info->mm_width, out_info->mm_height);
+            }
+
+            Status st = XRRSetCrtcConfig(dpy, res, out_info->crtc, CurrentTime,
+                                         crtc_info->x, crtc_info->y, found_mode,
+                                         crtc_info->rotation, &res->outputs[oi], 1);
+            if (st == Success) {
+                // Shrink the bounding box back down to exactly the new mode (best-effort;
+                // harmless no-op if it's already that size).
+                XRRSetScreenSize(dpy, root, req_w, req_h, out_info->mm_width, out_info->mm_height);
+                XSync(dpy, False);
+                *out_w = DisplayWidth(dpy, screen_num);
+                *out_h = DisplayHeight(dpy, screen_num);
+                applied = 1;
+            }
+            XRRFreeCrtcInfo(crtc_info);
+        }
+        XRRFreeOutputInfo(out_info);
+    }
+
+    XRRFreeScreenResources(res);
+    return applied;
+}
+
+static volatile sig_atomic_t g_should_exit = 0;
+static void handle_exit_signal(int sig) {
+    (void)sig;
+    g_should_exit = 1;
+}
+
 int main(int argc, char* argv[]) {
     int port = 5900;
     char config_password[256] = {0};
@@ -123,6 +208,7 @@ int main(int argc, char* argv[]) {
     int max_clients = 16;
     int websocket_enabled = 0;
     int udp_enabled = 1;
+    int resize_w = 0, resize_h = 0; // 0,0 = don't resize; use the display's current resolution
     const char* password = NULL;
     const char* listen_host = "0.0.0.0";
     const char* display_name = "leanrfb X11 Server";
@@ -180,6 +266,14 @@ int main(int argc, char* argv[]) {
                 } else {
                     udp_enabled = 0;
                 }
+            } else if (strcmp(key, "resize_resolution") == 0) {
+                int w = 0, h = 0;
+                if (sscanf(value, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                    resize_w = w;
+                    resize_h = h;
+                } else if (value[0] != '\0') {
+                    fprintf(stderr, "Warning: ignoring invalid resize_resolution '%s' (expected WIDTHxHEIGHT)\n", value);
+                }
             }
         }
         fclose(cf);
@@ -209,9 +303,25 @@ int main(int argc, char* argv[]) {
     }
 
     int screen_num = DefaultScreen(dpy);
+    Window root = RootWindow(dpy, screen_num);
+
+    int orig_width = DisplayWidth(dpy, screen_num);
+    int orig_height = DisplayHeight(dpy, screen_num);
+    int did_resize = 0;
+
+    if (resize_w > 0 && resize_h > 0 && (resize_w != orig_width || resize_h != orig_height)) {
+        int applied_w = 0, applied_h = 0;
+        if (x11_set_resolution(dpy, root, screen_num, resize_w, resize_h, &applied_w, &applied_h)) {
+            printf("Resized X display from %dx%d to %dx%d via XRandR.\n", orig_width, orig_height, applied_w, applied_h);
+            did_resize = 1;
+        } else {
+            fprintf(stderr, "Warning: could not switch to %dx%d (no matching XRandR mode found on any connected "
+                             "output) — keeping the current resolution.\n", resize_w, resize_h);
+        }
+    }
+
     int width = DisplayWidth(dpy, screen_num);
     int height = DisplayHeight(dpy, screen_num);
-    Window root = RootWindow(dpy, screen_num);
 
     printf("Sharing X11 screen (resolution %dx%d) on port %d...\n", width, height, port);
     if (password) {
@@ -310,9 +420,15 @@ int main(int argc, char* argv[]) {
 
     printf("Server is ready. Connect using a VNC viewer (e.g. 0.0.0.0:%d)\n", port);
 
+    // Caught (rather than left at the default terminate action) so a resized display
+    // gets restored to its original resolution below instead of being left resized
+    // after the server exits.
+    signal(SIGINT, handle_exit_signal);
+    signal(SIGTERM, handle_exit_signal);
+
     unsigned long long last_frame_time = get_time_ms();
 
-    while (1) {
+    while (!g_should_exit) {
         unsigned long long now = get_time_ms();
         unsigned long long elapsed = now - last_frame_time;
 
@@ -367,7 +483,16 @@ int main(int argc, char* argv[]) {
         vnc_server_poll(server, (int)sleep_time);
     }
 
-    // Cleanup (unreachable in infinite loop, but good practice)
+    // Cleanup (reached on SIGINT/SIGTERM)
+    printf("\nShutting down...\n");
+    if (did_resize) {
+        int restored_w = 0, restored_h = 0;
+        if (x11_set_resolution(dpy, root, screen_num, orig_width, orig_height, &restored_w, &restored_h)) {
+            printf("Restored X display to %dx%d.\n", restored_w, restored_h);
+        } else {
+            fprintf(stderr, "Warning: could not restore the original %dx%d resolution.\n", orig_width, orig_height);
+        }
+    }
     free(fb);
     if (has_shm) {
         XShmDetach(dpy, &shminfo);
