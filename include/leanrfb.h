@@ -16,6 +16,8 @@ typedef struct vnc_client vnc_client_t;
 typedef void (*vnc_key_event_cb)(vnc_server_t* server, vnc_client_t* client, uint32_t keysym, int down, void* user_data);
 // button_mask: bit 0: left, bit 1: middle, bit 2: right, bit 3: wheel up, bit 4: wheel down
 typedef void (*vnc_pointer_event_cb)(vnc_server_t* server, vnc_client_t* client, uint16_t x, uint16_t y, uint8_t button_mask, void* user_data);
+// Called when a client sends text to set on the server's clipboard (RFB ClientCutText message)
+typedef void (*vnc_clipboard_event_cb)(vnc_server_t* server, vnc_client_t* client, const char* text, uint32_t len, void* user_data);
 
 // Status codes for vnc_resize_request_cb, matching the standard RFB ExtendedDesktopSize
 // extension's status values exactly (see docs/custom/rfb_desktop_resize_extension.md).
@@ -61,6 +63,7 @@ typedef struct vnc_server_config {
     vnc_key_event_cb on_key;   // Key event callback
     vnc_pointer_event_cb on_pointer; // Pointer event callback
     vnc_resize_request_cb on_resize_request; // Desktop resize request callback
+    vnc_clipboard_event_cb on_clipboard; // Clipboard update event callback
     void* user_data;           // Custom user data pointer passed to callbacks
 } vnc_server_config_t;
 
@@ -92,6 +95,9 @@ void vnc_server_mark_dirty(vnc_server_t* server, uint16_t x, uint16_t y, uint16_
 // supports it. Safe to call at any time, including from within on_resize_request.
 // See docs/custom/rfb_desktop_resize_extension.md.
 void vnc_server_resize_framebuffer(vnc_server_t* server, uint16_t new_width, uint16_t new_height);
+
+// Send text to be set on the client's clipboard (RFB ServerCutText message)
+void vnc_server_send_clipboard(vnc_server_t* server, const char* text, uint32_t len);
 
 // Set the local rendering cursor shape (pixels in 32-bit ARGB/BGRA format)
 void vnc_server_set_cursor(vnc_server_t* server, const uint32_t* pixels, uint16_t w, uint16_t h, uint16_t xhot, uint16_t yhot);

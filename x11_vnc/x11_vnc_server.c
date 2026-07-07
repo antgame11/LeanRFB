@@ -14,6 +14,7 @@
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xrandr.h>
+#include <X11/Xatom.h>
 
 typedef struct {
     Display* dpy;
@@ -29,6 +30,7 @@ typedef struct {
     int has_shm;
     XShmSegmentInfo shminfo;
     XImage* shm_img;
+    Window selection_win;
 } x11_ctx_t;
 
 static void on_key(vnc_server_t* server, vnc_client_t* client, uint32_t keysym, int down, void* user_data) {
@@ -65,6 +67,31 @@ static void on_pointer(vnc_server_t* server, vnc_client_t* client, uint16_t x, u
     }
     ctx->last_buttons = button_mask;
 
+    XFlush(ctx->dpy);
+}
+
+static char* g_clipboard_text = NULL;
+static size_t g_clipboard_len = 0;
+
+static void on_clipboard(vnc_server_t* server, vnc_client_t* client, const char* text, uint32_t len, void* user_data) {
+    (void)server;
+    (void)client;
+    x11_ctx_t* ctx = (x11_ctx_t*)user_data;
+    if (!ctx || !ctx->dpy || ctx->selection_win == None) return;
+
+    free(g_clipboard_text);
+    g_clipboard_text = malloc(len + 1);
+    if (g_clipboard_text) {
+        memcpy(g_clipboard_text, text, len);
+        g_clipboard_text[len] = '\0';
+        g_clipboard_len = len;
+    } else {
+        g_clipboard_len = 0;
+    }
+
+    Atom clipboard_atom = XInternAtom(ctx->dpy, "CLIPBOARD", False);
+    XSetSelectionOwner(ctx->dpy, clipboard_atom, ctx->selection_win, CurrentTime);
+    XSetSelectionOwner(ctx->dpy, XA_PRIMARY, ctx->selection_win, CurrentTime);
     XFlush(ctx->dpy);
 }
 
@@ -442,6 +469,7 @@ int main(int argc, char* argv[]) {
     ctx.screen_num = DefaultScreen(dpy);
     ctx.root = RootWindow(dpy, ctx.screen_num);
     ctx.last_buttons = 0;
+    ctx.selection_win = XCreateSimpleWindow(dpy, ctx.root, 0, 0, 1, 1, 0, 0, 0);
 
     int orig_width = DisplayWidth(dpy, ctx.screen_num);
     int orig_height = DisplayHeight(dpy, ctx.screen_num);
@@ -485,6 +513,7 @@ int main(int argc, char* argv[]) {
     config.on_key = on_key;
     config.on_pointer = on_pointer;
     config.on_resize_request = on_resize_request;
+    config.on_clipboard = on_clipboard;
     config.user_data = &ctx;
 
     vnc_server_t* server = vnc_server_create(&config);
@@ -507,6 +536,10 @@ int main(int argc, char* argv[]) {
     int xfixes_event_base = 0;
     int xfixes_error_base = 0;
     int has_xfixes = XFixesQueryExtension(dpy, &xfixes_event_base, &xfixes_error_base);
+    if (has_xfixes) {
+        Atom clipboard_atom = XInternAtom(dpy, "CLIPBOARD", False);
+        XFixesSelectSelectionInput(dpy, ctx.root, clipboard_atom, XFixesSetSelectionOwnerNotifyMask);
+    }
     unsigned long last_cursor_serial = 0;
 
     printf("Server is ready. Connect using a VNC viewer (e.g. 0.0.0.0:%d)\n", port);
@@ -520,6 +553,76 @@ int main(int argc, char* argv[]) {
     unsigned long long last_frame_time = get_time_ms();
 
     while (!g_should_exit) {
+        // Process X11 clipboard/selection events
+        while (XPending(dpy)) {
+            XEvent ev;
+            XNextEvent(dpy, &ev);
+            if (ev.type == SelectionRequest) {
+                XSelectionRequestEvent* req = &ev.xselectionrequest;
+                XEvent resp;
+                memset(&resp, 0, sizeof(resp));
+                resp.type = SelectionNotify;
+                resp.xselection.display = dpy;
+                resp.xselection.requestor = req->requestor;
+                resp.xselection.selection = req->selection;
+                resp.xselection.target = req->target;
+                resp.xselection.time = req->time;
+                resp.xselection.property = None;
+
+                Atom utf8_atom = XInternAtom(dpy, "UTF8_STRING", False);
+                Atom string_atom = XInternAtom(dpy, "STRING", False);
+                Atom targets_atom = XInternAtom(dpy, "TARGETS", False);
+
+                if (req->target == targets_atom) {
+                    Atom supported[] = { targets_atom, utf8_atom, string_atom };
+                    XChangeProperty(dpy, req->requestor, req->property, XA_ATOM, 32,
+                                    PropModeReplace, (unsigned char*)supported, 3);
+                    resp.xselection.property = req->property;
+                } else if ((req->target == utf8_atom || req->target == string_atom) && g_clipboard_text) {
+                    XChangeProperty(dpy, req->requestor, req->property, req->target, 8,
+                                    PropModeReplace, (unsigned char*)g_clipboard_text, (int)g_clipboard_len);
+                    resp.xselection.property = req->property;
+                }
+
+                XSendEvent(dpy, req->requestor, True, 0, &resp);
+                XFlush(dpy);
+            } else if (ev.type == SelectionNotify) {
+                XSelectionEvent* sel = &ev.xselection;
+                if (sel->property != None) {
+                    Atom actual_type;
+                    int actual_format;
+                    unsigned long nitems, bytes_after;
+                    unsigned char* prop_data = NULL;
+                    if (XGetWindowProperty(dpy, sel->requestor, sel->property, 0, 65536, True,
+                                           AnyPropertyType, &actual_type, &actual_format,
+                                           &nitems, &bytes_after, &prop_data) == Success) {
+                        if (prop_data && nitems > 0) {
+                            if (!g_clipboard_text || g_clipboard_len != nitems ||
+                                memcmp(g_clipboard_text, prop_data, nitems) != 0) {
+                                free(g_clipboard_text);
+                                g_clipboard_text = malloc(nitems + 1);
+                                if (g_clipboard_text) {
+                                    memcpy(g_clipboard_text, prop_data, nitems);
+                                    g_clipboard_text[nitems] = '\0';
+                                    g_clipboard_len = nitems;
+                                    vnc_server_send_clipboard(server, g_clipboard_text, g_clipboard_len);
+                                }
+                            }
+                        }
+                        if (prop_data) XFree(prop_data);
+                    }
+                }
+            } else if (has_xfixes && ev.type == xfixes_event_base + XFixesSelectionNotify) {
+                XFixesSelectionNotifyEvent* sev = (XFixesSelectionNotifyEvent*)&ev;
+                Atom clipboard_atom = XInternAtom(dpy, "CLIPBOARD", False);
+                if (sev->selection == clipboard_atom && sev->owner != ctx.selection_win) {
+                    Atom utf8_atom = XInternAtom(dpy, "UTF8_STRING", False);
+                    Atom target_prop = XInternAtom(dpy, "VNC_SELECTION", False);
+                    XConvertSelection(dpy, clipboard_atom, utf8_atom, target_prop, ctx.selection_win, CurrentTime);
+                }
+            }
+        }
+
         unsigned long long now = get_time_ms();
         unsigned long long elapsed = now - last_frame_time;
 

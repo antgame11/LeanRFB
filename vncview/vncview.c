@@ -989,6 +989,58 @@ static void reasm_check_timeout(void) {
     }
 }
 
+static char* last_sent_clipboard = NULL;
+
+static gboolean apply_server_clipboard_idle(gpointer data) {
+    char* text = (char*)data;
+    if (text) {
+        GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+        
+        // Update our last_sent_clipboard cache to prevent feedback loops
+        free(last_sent_clipboard);
+        last_sent_clipboard = strdup(text);
+        
+        gtk_clipboard_set_text(clipboard, text, -1);
+        free(text);
+    }
+    return FALSE;
+}
+
+static void on_clipboard_text_received(GtkClipboard* clipboard, const char* text, gpointer user_data) {
+    (void)clipboard;
+    (void)user_data;
+    if (text && vnc_fd >= 0) {
+        // Prevent feedback loop
+        if (last_sent_clipboard && strcmp(last_sent_clipboard, text) == 0) {
+            return;
+        }
+        
+        free(last_sent_clipboard);
+        last_sent_clipboard = strdup(text);
+        
+        int len = strlen(text);
+        if (len > 0) {
+            uint8_t* buf = malloc(8 + (size_t)len);
+            if (buf) {
+                buf[0] = 6; // ClientCutText
+                buf[1] = 0;
+                buf[2] = 0;
+                buf[3] = 0;
+                write_u32_be(buf + 4, (uint32_t)len);
+                memcpy(buf + 8, text, (size_t)len);
+                send(vnc_fd, buf, 8 + (size_t)len, 0);
+                free(buf);
+            }
+        }
+    }
+}
+
+static void on_clipboard_owner_change(GtkClipboard* clipboard, GdkEvent* event, gpointer user_data) {
+    (void)event;
+    (void)user_data;
+    gtk_clipboard_request_text(clipboard, on_clipboard_text_received, NULL);
+}
+
 // Background network client loop thread (after handshake is complete)
 static void* vnc_client_thread(void* arg) {
     (void)arg;
@@ -1204,6 +1256,21 @@ static void* vnc_client_thread(void* arg) {
             pthread_mutex_unlock(&backbuffer_mutex);
 
             g_idle_add((GSourceFunc)queue_draw_idle, NULL);
+        }
+        else if (msg_type == 3) { // ServerCutText
+            uint8_t pad[3];
+            uint32_t length;
+            if (read_exact(fd, pad, 3) < 0 || read_exact(fd, &length, 4) < 0) break;
+            length = read_u32_be((uint8_t*)&length);
+            
+            char* text = malloc(length + 1);
+            if (read_exact(fd, text, length) < 0) {
+                free(text);
+                break;
+            }
+            text[length] = '\0';
+            
+            g_idle_add(apply_server_clipboard_idle, text);
         }
     }
 
@@ -1549,6 +1616,9 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
 
 int main(int argc, char* argv[]) {
     gtk_init(&argc, &argv);
+
+    GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    g_signal_connect(G_OBJECT(clipboard), "owner-change", G_CALLBACK(on_clipboard_owner_change), NULL);
 
     // Create main clean dialog window
     main_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);

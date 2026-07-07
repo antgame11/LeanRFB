@@ -213,6 +213,7 @@ struct vnc_server {
   vnc_key_event_cb on_key;
   vnc_pointer_event_cb on_pointer;
   vnc_resize_request_cb on_resize_request;
+  vnc_clipboard_event_cb on_clipboard;
   void *user_data;
 
   char *password;

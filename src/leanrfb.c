@@ -353,6 +353,7 @@ vnc_server_t* vnc_server_create(const vnc_server_config_t* config) {
     server->on_key = config->on_key;
     server->on_pointer = config->on_pointer;
     server->on_resize_request = config->on_resize_request;
+    server->on_clipboard = config->on_clipboard;
     server->user_data = config->user_data;
     server->password = config->password ? strdup(config->password) : NULL;
     server->max_clients = (config->max_clients > 0) ? config->max_clients : VNC_MAX_CLIENTS_DEFAULT;
@@ -1238,6 +1239,16 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                 if (length > (uint32_t)VNC_CLIPBOARD_MAX_LEN) goto disconnect;
                 if (remaining < 8 + (size_t)length) break;
                 processed += 8 + (size_t)length;
+
+                if (server->on_clipboard && length > 0) {
+                    char* text = (char*)malloc(length + 1);
+                    if (text) {
+                        memcpy(text, p + 8, length);
+                        text[length] = '\0';
+                        server->on_clipboard(server, client, text, length, server->user_data);
+                        free(text);
+                    }
+                }
             }
             else if (msg_type == VNC_MSG_SET_DESKTOP_SIZE) { // SetDesktopSize (RFB ExtendedDesktopSize extension)
                 if (remaining < 8) break;
@@ -1799,4 +1810,29 @@ void vnc_server_set_cursor(vnc_server_t* server, const uint32_t* pixels, uint16_
 
 int vnc_server_has_clients(const vnc_server_t* server) {
     return server && server->clients != NULL;
+}
+
+void vnc_server_send_clipboard(vnc_server_t* server, const char* text, uint32_t len) {
+    if (!server || !text || len == 0) return;
+
+    vnc_client_t* client = server->clients;
+    while (client) {
+        if (client->state == VNC_STATE_NORMAL) {
+            uint8_t header[8];
+            header[0] = 3; // ServerCutText
+            header[1] = 0;
+            header[2] = 0;
+            header[3] = 0;
+            write_u32_be(header + 4, len);
+
+            if (client_ensure_write_space(client, 8 + len) == 0) {
+                memcpy(&client->write_buf[client->write_len], header, 8);
+                client->write_len += 8;
+                memcpy(&client->write_buf[client->write_len], text, len);
+                client->write_len += len;
+                vnc_client_flush(client);
+            }
+        }
+        client = client->next;
+    }
 }
