@@ -120,6 +120,13 @@ void* vnc_vp9_encoder_create(int width, int height, int fps, int quality) {
         // its own equivalent no-lookahead setting.
         enc->codec_ctx->max_b_frames = 0;
 
+            {
+                int64_t bitrate = vnc_video_target_bitrate(width, height, fps);
+                enc->codec_ctx->bit_rate = bitrate;
+                enc->codec_ctx->rc_max_rate = bitrate;
+                enc->codec_ctx->rc_buffer_size = (int)(bitrate / 4); // ~250ms, keeps frame sizes consistent for low latency
+            }
+
             // Create VA-API frames context
             AVBufferRef* hw_frames_ref = av_hwframe_ctx_alloc(enc->hw_device_ctx);
             if (hw_frames_ref) {
@@ -163,6 +170,13 @@ void* vnc_vp9_encoder_create(int width, int height, int fps, int quality) {
         // alone isn't sufficient. libvpx-vp9 below also gets lag-in-frames=0,
         // its own equivalent no-lookahead setting.
         enc->codec_ctx->max_b_frames = 0;
+
+        {
+            int64_t bitrate = vnc_video_target_bitrate(width, height, fps);
+            enc->codec_ctx->bit_rate = bitrate;
+            enc->codec_ctx->rc_max_rate = bitrate;
+            enc->codec_ctx->rc_buffer_size = (int)(bitrate / 4); // ~250ms, keeps frame sizes consistent for low latency
+        }
 
         enc->codec_ctx->thread_count = 0;
         enc->codec_ctx->thread_type = FF_THREAD_SLICE;

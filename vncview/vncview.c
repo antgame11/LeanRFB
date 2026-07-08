@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <poll.h>
@@ -589,17 +590,6 @@ static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
         waiting_for_draw = 1;
         pthread_mutex_unlock(&backbuffer_mutex);
         g_idle_add((GSourceFunc)queue_draw_idle, NULL);
-
-        // The server only encodes/sends another video frame once it sees a fresh
-        // FramebufferUpdateRequest (client->update_requested), same as for any other
-        // encoding — but UDP-delivered frames never go through vnc_core_process_message's
-        // TCP FramebufferUpdate handling, which is the only place that request normally
-        // gets sent. Without this, the server sends exactly one frame over UDP and then
-        // stops forever (has nothing left asking it to continue), leaving the client
-        // stuck on a single stale/black frame. Re-request here so UDP video keeps flowing.
-        if (vnc_fd >= 0) {
-            vnc_core_send_fb_request(1, 0, 0, screen_w, screen_h);
-        }
     }
 }
 
@@ -708,7 +698,7 @@ static void* vnc_client_thread(void* arg) {
             // Heartbeat
             unsigned long long now = vv_now_ms();
             if (now - udp_last_heartbeat_ms >= VNC_UDP_HEARTBEAT_INTERVAL_MS) {
-                uint8_t payload[1] = { 0 }; 
+                uint8_t payload[1] = { 0 };
                 uint8_t cipher[VNC_UDP_MAX_DATAGRAM];
                 int cipher_len = udp_seal(udp_key, VNC_UDP_TYPE_HELLO, udp_cid, ++udp_send_ctr, payload, 0, cipher, sizeof(cipher));
                 if (cipher_len > 0 && udp_fd >= 0) {
@@ -1325,6 +1315,15 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
         return;
     }
     DEBUG_LOG("TCP connect succeeded");
+
+    // Without this, Nagle's algorithm can hold small outbound packets (input
+    // events, FramebufferUpdateRequests) for up to ~200-500ms waiting to
+    // coalesce with more data — the server already disables it on its side,
+    // but that only controls the server->client direction.
+    {
+        int nodelay = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+    }
 
     tv.tv_sec = 0;
     tv.tv_usec = 0;

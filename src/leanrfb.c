@@ -673,7 +673,19 @@ int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
     // 3. Process pending updates for connected, initialized clients
     client = server->clients;
     while (client) {
-        if (client->state == VNC_STATE_NORMAL && client->update_requested) {
+        // H.264/VP9 clients get pushed a new frame whenever there's new dirty
+        // content, not gated on update_requested. That flag models VNC's
+        // traditional pull semantics (client explicitly asks, server answers
+        // once) — fine for static raw/tight/hextile updates, but wrong for a
+        // continuous video stream: requiring a fresh FramebufferUpdateRequest
+        // between every single frame turns each frame into a full network
+        // round trip before the next one can even start encoding, which is
+        // where the bulk of perceived video latency was coming from.
+        // vnc_client_send_update()/vnc_send_video_update() already no-op
+        // cheaply when there's nothing dirty, so calling it unconditionally
+        // here is safe.
+        int wants_continuous_video = client->supports_h264 || client->supports_vp9;
+        if (client->state == VNC_STATE_NORMAL && (client->update_requested || wants_continuous_video)) {
             vnc_client_send_update(server, client);
         }
         // Independent of the video FramebufferUpdateRequest cycle above — audio
@@ -1485,6 +1497,16 @@ disconnect:
     vnc_client_disconnect(server, client);
 }
 
+// Target frame rate for H.264/VP9 encoding — used both at encoder creation and
+// to rate-limit how often vnc_send_video_update() actually attempts an encode.
+// Since that function is now called on every poll iteration for video clients
+// (see vnc_server_poll — no longer gated on the client re-requesting), without
+// this it would encode+send as fast as the poll loop cycles, often many times
+// faster than the source content even changes: wasted CPU that under load
+// becomes its own source of stutter, chasing content that's already stale by
+// the time the previous redundant frame finished encoding.
+#define VNC_VIDEO_FPS 30
+
 // Function-pointer table describing one video codec's encoder, so the UDP/TCP dispatch
 // logic below (identical for every codec) only needs to be written once. See
 // src/leanrfb_h264.c / src/leanrfb_vp9.c for the concrete implementations.
@@ -1524,8 +1546,18 @@ static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
         return;
     }
 
+    // Rate-limit to VNC_VIDEO_FPS regardless of how often this gets called —
+    // dirty_tiles stays marked so we just try again on the next eligible tick.
+    // Stamped now (not just on success) so a stalled/erroring encoder gets
+    // retried at a sane cadence too, rather than spinning as fast as possible.
+    unsigned long long now_ms = get_time_ms();
+    if (now_ms - client->last_video_send_ms < (1000 / VNC_VIDEO_FPS)) {
+        return;
+    }
+    client->last_video_send_ms = now_ms;
+
     if (!*enc_slot) {
-        *enc_slot = ops->create(server->width, server->height, 30, 80);
+        *enc_slot = ops->create(server->width, server->height, VNC_VIDEO_FPS, 80);
         if (!*enc_slot) return;
     }
 

@@ -8,6 +8,17 @@
 #include <stdint.h>
 #include <time.h>
 
+// Target bitrate for real-time desktop/screen-content video encoding
+// (src/leanrfb_h264.c, src/leanrfb_vp9.c), scaled by resolution and frame rate.
+// Screen content (sharp text, UI edges) needs more bits per pixel than natural
+// video to stay legible, and none of the encoder backends had an explicit
+// bitrate set before — each was silently falling back to its own (often very
+// low) default, which is why output quality was poor regardless of codec.
+static inline int64_t vnc_video_target_bitrate(int width, int height, int fps) {
+    int64_t bps = (int64_t)width * height * fps / 8; // ~0.125 bits/pixel/frame
+    return bps < 1000000 ? 1000000 : bps; // floor of 1 Mbps so tiny framebuffers still look decent
+}
+
 typedef enum {
   VNC_STATE_DETECT_WEBSOCKET,
   VNC_STATE_PROTOCOL_VERSION,
@@ -156,6 +167,7 @@ struct vnc_client {
   void *vp9_enc;
   int force_keyframe_requested; // set when client asks the encoder to emit a fresh IDR/keyframe
   int video_stall_frames; // consecutive encode() calls that produced no packet (diagnostic)
+  unsigned long long last_video_send_ms; // rate-limits vnc_send_video_update() to VNC_VIDEO_FPS
 
   // UDP H.264 transport (see docs/custom/rfb_h264_udp_extension.md)
   int supports_udp;          // client advertised VNC_ENCODING_UDP_SETUP
