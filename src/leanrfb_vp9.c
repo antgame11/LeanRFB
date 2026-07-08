@@ -263,6 +263,7 @@ int vnc_vp9_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_data
     }
     if (enc->force_keyframe) {
         send_frame->pict_type = AV_PICTURE_TYPE_I;
+        send_frame->flags |= AV_FRAME_FLAG_KEY;
         enc->force_keyframe = 0;
     }
 

@@ -255,6 +255,7 @@ static AVPacket* pkt = NULL;
 static struct SwsContext* sws_ctx = NULL;
 static enum AVPixelFormat last_format = AV_PIX_FMT_NONE;
 static int decoder_primed = 0;
+static int decoder_has_keyframe = 0;
 static enum AVCodecID active_video_codec_id = AV_CODEC_ID_H264;
 static enum AVPixelFormat expected_hw_pix_fmt = AV_PIX_FMT_NONE;
 
@@ -391,6 +392,7 @@ static void reset_decoder(int w, int h) {
     sw_frame = av_frame_alloc();
     pkt = av_packet_alloc();
     decoder_primed = 1;
+    decoder_has_keyframe = 0;
     DEBUG_LOG("Decoder initialized successfully (size=%dx%d)", w, h);
 }
 
@@ -447,6 +449,11 @@ static void decode_video(const uint8_t* payload, int len, uint8_t* out_bgra, int
 
 static void request_keyframe(void) {
     if (vnc_fd < 0) return;
+    unsigned long long now = vv_now_ms();
+    if (now - udp_last_keyframe_request_ms < 500) {
+        return;
+    }
+    udp_last_keyframe_request_ms = now;
     DEBUG_LOG("requesting keyframe from server...");
     uint8_t msg = VNC_MSG_REQUEST_KEYFRAME;
     send(vnc_fd, &msg, 1, 0);
@@ -577,9 +584,14 @@ static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
 
         if (reasm_flags & 2) {
             reset_decoder(screen_w, screen_h);
+            decoder_has_keyframe = 1;
         }
         if (decoder_primed && total_len > 0) {
             decode_video(reasm_buf, (int)total_len, backbuffer, screen_w, screen_h);
+        }
+        if (!decoder_has_keyframe) {
+            DEBUG_LOG("reasm: completed a frame but decoder has no keyframe; requesting keyframe");
+            request_keyframe();
         }
 
         have_last_completed_frame = 1;
@@ -1236,6 +1248,7 @@ static int on_custom_encoding_cb(int fd, uint32_t encoding, uint16_t rx, uint16_
 
         if (flags & 2) {
             reset_decoder(rw, rh);
+            decoder_has_keyframe = 1;
         }
 
         if (decoder_primed && length > 0) {

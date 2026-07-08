@@ -1606,6 +1606,17 @@ static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
         }
     }
 
+    int udp_active = client->supports_udp && client->udp_ready && server->udp_fd >= 0 &&
+                     (get_time_ms() - client->udp_last_recv_ms < VNC_UDP_LIVENESS_TIMEOUT_MS);
+    if (udp_active) {
+        if (!client->was_udp_active) {
+            client->force_keyframe_requested = 1;
+            client->was_udp_active = 1;
+        }
+    } else {
+        client->was_udp_active = 0;
+    }
+
     if (client->force_keyframe_requested) {
         ops->force_keyframe(*enc_slot);
         client->force_keyframe_requested = 0;
@@ -1643,9 +1654,6 @@ static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
         // client's decoder permanently unprimed (a black screen) until the next GOP
         // boundary keyframe, sometimes seconds later.
         uint32_t flags = is_key ? 2 : 0;
-
-        int udp_active = client->supports_udp && client->udp_ready && server->udp_fd >= 0 &&
-                         (get_time_ms() - client->udp_last_recv_ms < VNC_UDP_LIVENESS_TIMEOUT_MS);
 
         if (udp_active && vnc_udp_send_video_frame(server, client, video_data, video_len, (int)flags) == 0) {
             memset(client->dirty_tiles, 0, (size_t)server->cols * server->rows);

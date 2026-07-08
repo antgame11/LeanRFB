@@ -173,6 +173,7 @@ struct vnc_client {
   int supports_udp;          // client advertised VNC_ENCODING_UDP_SETUP
   int udp_setup_sent;        // 1 once the one-time setup message has been sent over TCP
   int udp_ready;             // 1 once a valid Hello has been received from this client
+  int was_udp_active;        // 1 if UDP was active in the last video send update check
   uint8_t udp_key[VNC_UDP_KEY_LEN];
   uint8_t udp_cid[VNC_UDP_CID_LEN];
   struct sockaddr_storage udp_addr;
