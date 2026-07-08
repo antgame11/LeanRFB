@@ -13,40 +13,32 @@
 #include <sys/stat.h>
 #include <gtk/gtk.h>
 #include <gdk/gdkkeysyms.h>
-#include <openssl/des.h>
 #include <openssl/evp.h>
-#include <jpeglib.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <time.h>
 
-// Non-essential diagnostic logging (connection lifecycle, encoding negotiation, UDP
-// transport handshake/reassembly, decoder state). Silent by default; build with
-// `make vncviewer DEBUG=1` (defines VNC_DEBUG) to see it on stderr. Genuine, unexpected
-// failures (a decoder that can't be opened, a socket that unexpectedly closes, etc.)
-// are still reported unconditionally via fprintf/show_error_dialog regardless of this.
+#include "vnc_client_core.h"
+
+// Non-essential diagnostic logging
 #ifdef VNC_DEBUG
 #define DEBUG_LOG(fmt, ...) fprintf(stderr, "[VNCVIEW DEBUG] " fmt "\n", ##__VA_ARGS__)
 #else
 #define DEBUG_LOG(fmt, ...) do {} while (0)
 #endif
 
-// Standard VNC macros
-#define write_u16_be(buf, val) do { \
-    (buf)[0] = (uint8_t)((val) >> 8); \
-    (buf)[1] = (uint8_t)(val); \
-} while(0)
+// Byte-order conversion helper functions (needed locally for UDP headers)
+static inline void write_u16_be(uint8_t *buf, uint16_t val) {
+    buf[0] = (uint8_t)(val >> 8);
+    buf[1] = (uint8_t)val;
+}
 
-#define write_u32_be(buf, val) do { \
-    (buf)[0] = (uint8_t)((val) >> 24); \
-    (buf)[1] = (uint8_t)((val) >> 16); \
-    (buf)[2] = (uint8_t)((val) >> 8); \
-    (buf)[3] = (uint8_t)(val); \
-} while(0)
-
-static inline uint16_t read_u16_be(const uint8_t *buf) {
-    return ((uint16_t)buf[0] << 8) | buf[1];
+static inline void write_u32_be(uint8_t *buf, uint32_t val) {
+    buf[0] = (uint8_t)(val >> 24);
+    buf[1] = (uint8_t)(val >> 16);
+    buf[2] = (uint8_t)(val >> 8);
+    buf[3] = (uint8_t)val;
 }
 
 static inline uint32_t read_u32_be(const uint8_t *buf) {
@@ -55,9 +47,6 @@ static inline uint32_t read_u32_be(const uint8_t *buf) {
 }
 
 // --- Encrypted UDP transport for H.264 (see docs/custom/rfb_h264_udp_extension.md) ---
-// Mirrors the constants and AEAD framing used by src/leanrfb_udp.c; vncview.c does not
-// link against libleanrfb, so the wire format is reimplemented here (the VNC auth DES
-// helper above is duplicated the same way).
 #define VNC_ENCODING_UDP_SETUP 51
 #define VNC_UDP_TYPE_VIDEO 0
 #define VNC_UDP_TYPE_HELLO 1
@@ -70,28 +59,15 @@ static inline uint32_t read_u32_be(const uint8_t *buf) {
 #define VNC_UDP_MAX_FRAGS 512
 #define VNC_UDP_MAX_DATAGRAM (VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN + VNC_UDP_INNER_HDR_LEN + VNC_UDP_MAX_FRAG_PAYLOAD)
 #define VNC_UDP_HEARTBEAT_INTERVAL_MS 2000
-// If a frame's fragments stop arriving (loss/reordering with no recovery), abandon it after
-// this long rather than waiting forever — otherwise the client would never send its next
-// FramebufferUpdateRequest (that only happens after a frame is decoded+drawn) and the whole
-// exchange would deadlock permanently on a single dropped datagram.
 #define VNC_UDP_REASM_TIMEOUT_MS 400
-// Codec byte appended to the UDP setup payload so the client knows which decoder to
-// instantiate for this session regardless of transport (see leanrfb_internal.h).
 #define VNC_UDP_CODEC_H264 0
 #define VNC_UDP_CODEC_VP9 1
 #define VNC_UDP_SETUP_PAYLOAD_LEN (2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN + 1)
 #define VNC_ENCODING_VP9 52
 #define VNC_MSG_REQUEST_KEYFRAME 254
 
-// --- Live desktop resize: standard RFB ExtendedDesktopSize/SetDesktopSize extension
-// (see docs/custom/rfb_desktop_resize_extension.md). Constants verified byte-for-byte
-// against the reference LibVNCServer implementation.
-#define VNC_ENCODING_EXT_DESKTOP_SIZE ((int32_t)0xFFFFFECC) // -308
+// Live desktop resize debounce configuration
 #define VNC_MSG_SET_DESKTOP_SIZE 251
-#define VNC_EDS_STATUS_SUCCESS 0
-// How long to wait after the drawing area's size stops changing before actually asking
-// the server to resize (dragging a window edge fires many events per second — we only
-// want to act once it settles).
 #define VNC_RESIZE_DEBOUNCE_MS 400
 
 typedef struct {
@@ -198,69 +174,17 @@ static int udp_open(const uint8_t key[VNC_UDP_KEY_LEN], const uint8_t* in, int i
 static int udp_replay_check(udp_replay_state_t* st, uint64_t counter) {
     if (counter > st->highest) {
         uint64_t shift = counter - st->highest;
-        st->bitmap = (shift >= 64) ? 0 : (st->bitmap << shift);
-        st->bitmap |= 1ULL;
+        if (shift >= 64) st->bitmap = 0;
+        else st->bitmap <<= shift;
         st->highest = counter;
+        st->bitmap |= 1ULL;
         return 1;
     }
-    uint64_t diff = st->highest - counter;
-    if (diff >= 64) return 0;
-    uint64_t mask = 1ULL << diff;
-    if (st->bitmap & mask) return 0;
-    st->bitmap |= mask;
+    uint64_t age = st->highest - counter;
+    if (age >= 64) return 0;
+    if (st->bitmap & (1ULL << age)) return 0; // replay
+    st->bitmap |= (1ULL << age);
     return 1;
-}
-
-// VNC auth helper
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-static void vnc_encrypt_bytes(const char* password, const uint8_t* challenge, uint8_t* response) {
-    unsigned char key[8] = {0};
-    size_t pass_len = strlen(password);
-    for (int i = 0; i < 8; i++) {
-        unsigned char b = (i < (int)pass_len) ? (unsigned char)password[i] : 0;
-        unsigned char rev = 0;
-        for (int bit = 0; bit < 8; bit++) {
-            if (b & (1 << bit)) {
-                rev |= (1 << (7 - bit));
-            }
-        }
-        key[i] = rev;
-    }
-    DES_key_schedule schedule;
-    DES_set_key((DES_cblock*)key, &schedule);
-    DES_ecb_encrypt((DES_cblock*)challenge, (DES_cblock*)response, &schedule, DES_ENCRYPT);
-    DES_ecb_encrypt((DES_cblock*)(challenge + 8), (DES_cblock*)(response + 8), &schedule, DES_ENCRYPT);
-}
-#pragma GCC diagnostic pop
-
-// Last used address helpers
-static void load_last_address(char* host_out, int* port_out) {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/.config/vncviewer/last_address.conf", g_get_home_dir());
-    FILE* f = fopen(path, "r");
-    if (!f) {
-        strcpy(host_out, "127.0.0.1");
-        *port_out = 5900;
-        return;
-    }
-    if (fscanf(f, "%255s %d", host_out, port_out) != 2) {
-        strcpy(host_out, "127.0.0.1");
-        *port_out = 5900;
-    }
-    fclose(f);
-}
-
-static void save_last_address(const char* host, int port) {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/.config/vncviewer", g_get_home_dir());
-    g_mkdir_with_parents(path, 0700);
-    snprintf(path, sizeof(path), "%s/.config/vncviewer/last_address.conf", g_get_home_dir());
-    FILE* f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "%s %d\n", host, port);
-        fclose(f);
-    }
 }
 
 // Global UI widgets
@@ -270,27 +194,20 @@ static GtkWidget* drawing_area = NULL;
 static GtkWidget* entry_address = NULL;
 static GtkWidget* combo_encoding = NULL;
 
-// Thread-shared VNC client states
-static int vnc_fd = -1;
-static int screen_w = 0;
-static int screen_h = 0;
-static uint8_t* backbuffer = NULL;
-static pthread_mutex_t backbuffer_mutex = PTHREAD_MUTEX_INITIALIZER;
-static volatile int client_running = 0;
+// TCP socket descriptor
+int vnc_fd = -1;
 static uint8_t button_mask = 0;
 static char preferred_encoding[32] = "h264";
 static volatile int waiting_for_draw = 0;
 
-// Live desktop resize (see docs/custom/rfb_desktop_resize_extension.md). The debounce
-// timer and pending size are only ever touched on the GTK main thread (configure-event
-// handler + its own timeout callback).
+// Live desktop resize variables
 static guint resize_debounce_source = 0;
 static int pending_resize_w = 0;
 static int pending_resize_h = 0;
 
-// UDP H.264 transport state (owned by vnc_client_thread; see docs/custom/rfb_h264_udp_extension.md)
+// UDP H.264 transport state variables
 static int udp_fd = -1;
-static struct in_addr udp_server_in_addr; // set from the TCP connection's resolved address
+static struct in_addr udp_server_in_addr;
 static struct sockaddr_in udp_server_addr;
 static uint8_t udp_key[VNC_UDP_KEY_LEN];
 static uint8_t udp_cid[VNC_UDP_CID_LEN];
@@ -301,8 +218,6 @@ static unsigned long long udp_last_heartbeat_ms = 0;
 static unsigned long long udp_last_keyframe_request_ms = 0;
 static unsigned long long reasm_start_ms = 0;
 
-// UDP frame reassembly state (single in-flight frame; stale/incomplete frames are dropped
-// rather than blocking, since low latency matters more than never losing a frame here)
 static int reasm_active = 0;
 static uint32_t reasm_frame_id = 0;
 static uint16_t reasm_frag_count = 0;
@@ -318,95 +233,70 @@ static uint32_t last_completed_frame_id = 0;
 // FFmpeg variables
 static AVCodecContext* codec_ctx = NULL;
 static AVFrame* frame = NULL;
+static AVFrame* sw_frame = NULL;
+static AVBufferRef* hw_device_ctx = NULL;
+static enum AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
 static AVPacket* pkt = NULL;
 static struct SwsContext* sws_ctx = NULL;
-static AVBufferRef* hw_device_ctx = NULL;
-static AVFrame* sw_frame = NULL;
-static enum AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
 static enum AVPixelFormat last_format = AV_PIX_FMT_NONE;
-static enum AVPixelFormat expected_hw_pix_fmt = AV_PIX_FMT_NONE;
-// Which codec init_decoder()/decode_video() should use — set from whichever encoding
-// (TCP rect 50/52, or the UDP setup codec byte) the server actually negotiated, so this
-// never depends on guessing from our own dropdown selection.
-static enum AVCodecID active_video_codec_id = AV_CODEC_ID_H264;
-// The server only guarantees a frame is self-decodable (carries its own SPS/PPS, no
-// dependency on prior frames) on the specific frame it marks with the resetAllContextsFlag
-// (flags bit 0x02) — decode_video()'s own lazy decoder creation would otherwise try to
-// decode whatever video payload happens to arrive first, which for some encoders (notably
-// hardware encoders like VA-API) is *not* that self-contained frame and fails decode with
-// errors like "non-existing PPS 0 referenced". Drop any payload until we've seen a reset.
 static int decoder_primed = 0;
+static enum AVCodecID active_video_codec_id = AV_CODEC_ID_H264;
+static enum AVPixelFormat expected_hw_pix_fmt = AV_PIX_FMT_NONE;
+
+// GTK clipboard synchronization variables
+static char* last_sent_clipboard = NULL;
+
+static void show_error_dialog(GtkWindow* parent, const char* message) {
+    GtkWidget* dialog = gtk_message_dialog_new(parent,
+                                               GTK_DIALOG_DESTROY_WITH_PARENT,
+                                               GTK_MESSAGE_ERROR,
+                                               GTK_BUTTONS_CLOSE,
+                                               "%s", message);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static void save_last_address(const char* host, int port) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.config/vncviewer", g_get_home_dir());
+    g_mkdir_with_parents(path, 0700);
+    snprintf(path, sizeof(path), "%s/.config/vncviewer/last_address.conf", g_get_home_dir());
+    FILE* f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "%s %d\n", host, port);
+        fclose(f);
+    }
+}
+
+static void load_last_address(char* host_out, int* port_out) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.config/vncviewer/last_address.conf", g_get_home_dir());
+    FILE* f = fopen(path, "r");
+    if (f) {
+        if (fscanf(f, "%255s %d", host_out, port_out) != 2) {
+            strcpy(host_out, "127.0.0.1");
+            *port_out = 5900;
+        }
+        fclose(f);
+    } else {
+        strcpy(host_out, "127.0.0.1");
+        *port_out = 5900;
+    }
+}
 
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
     (void)ctx;
     const enum AVPixelFormat *p;
     for (p = pix_fmts; *p != -1; p++) {
         if (*p == expected_hw_pix_fmt) {
-            hw_pix_fmt = *p;
             return *p;
         }
     }
-    fprintf(stderr, "Failed to get expected HW surface format.\n");
+    fprintf(stderr, "Failed to get HW surface format.\n");
     return AV_PIX_FMT_NONE;
 }
 
-static void init_decoder(int width, int height) {
-    const AVCodec* codec = avcodec_find_decoder(active_video_codec_id);
-    if (!codec) {
-        fprintf(stderr, "Error: %s decoder not found in libavcodec\n",
-                active_video_codec_id == AV_CODEC_ID_VP9 ? "VP9" : "H.264");
-        return;
-    }
-    DEBUG_LOG("init_decoder: codec=%s %dx%d",
-              active_video_codec_id == AV_CODEC_ID_VP9 ? "VP9" : "H.264", width, height);
-    codec_ctx = avcodec_alloc_context3(codec);
-    codec_ctx->width = width;
-    codec_ctx->height = height;
-    codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-
-    codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-    codec_ctx->thread_count = 0;
-    codec_ctx->thread_type = FF_THREAD_SLICE;
-
-    // Attempt to initialize GPU VA-API (Intel/AMD)
-    int ret = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0);
-    if (ret >= 0) {
-        codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-        codec_ctx->get_format = get_hw_format;
-        expected_hw_pix_fmt = AV_PIX_FMT_VAAPI;
-        DEBUG_LOG("GPU VA-API Hardware Decoding enabled successfully.");
-    } else {
-        // Try GPU CUDA (Nvidia)
-        ret = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0);
-        if (ret >= 0) {
-            codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-            codec_ctx->get_format = get_hw_format;
-            expected_hw_pix_fmt = AV_PIX_FMT_CUDA;
-            DEBUG_LOG("GPU CUDA Hardware Decoding enabled successfully.");
-        } else {
-            expected_hw_pix_fmt = AV_PIX_FMT_NONE;
-            DEBUG_LOG("GPU Hardware Decoding not supported. Falling back to CPU software decoding.");
-        }
-    }
-
-    AVDictionary* opts = NULL;
-    av_dict_set(&opts, "tune", "zerolatency", 0);
-
-    if (avcodec_open2(codec_ctx, codec, &opts) < 0) {
-        fprintf(stderr, "Error: Could not open libavcodec %s decoder\n",
-                active_video_codec_id == AV_CODEC_ID_VP9 ? "VP9" : "H.264");
-    }
-    av_dict_free(&opts);
-
-    frame = av_frame_alloc();
-    pkt = av_packet_alloc();
-    sw_frame = av_frame_alloc();
-    last_format = AV_PIX_FMT_NONE;
-}
-
-static void reset_decoder(int width, int height) {
-    DEBUG_LOG("reset_decoder: discarding decoder state and priming for a fresh keyframe (%dx%d)", width, height);
+static void reset_decoder(int w, int h) {
     if (codec_ctx) {
         avcodec_free_context(&codec_ctx);
         codec_ctx = NULL;
@@ -415,13 +305,13 @@ static void reset_decoder(int width, int height) {
         av_frame_free(&frame);
         frame = NULL;
     }
-    if (pkt) {
-        av_packet_free(&pkt);
-        pkt = NULL;
-    }
     if (sw_frame) {
         av_frame_free(&sw_frame);
         sw_frame = NULL;
+    }
+    if (pkt) {
+        av_packet_free(&pkt);
+        pkt = NULL;
     }
     if (hw_device_ctx) {
         av_buffer_unref(&hw_device_ctx);
@@ -434,468 +324,210 @@ static void reset_decoder(int width, int height) {
     hw_pix_fmt = AV_PIX_FMT_NONE;
     last_format = AV_PIX_FMT_NONE;
     expected_hw_pix_fmt = AV_PIX_FMT_NONE;
+    decoder_primed = 0;
+
+    const AVCodec* codec = avcodec_find_decoder(active_video_codec_id);
+    if (!codec) {
+        fprintf(stderr, "Error: Decoder not found in libavcodec\n");
+        return;
+    }
+
+    codec_ctx = avcodec_alloc_context3(codec);
+    if (!codec_ctx) return;
+
+    // Check for VAAPI HW acceleration options
+    int use_vaapi = 0;
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+        if (!config) break;
+        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == AV_HWDEVICE_TYPE_VAAPI) {
+            expected_hw_pix_fmt = config->pix_fmt;
+            use_vaapi = 1;
+            break;
+        }
+    }
+
+    if (use_vaapi) {
+        if (av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0) >= 0) {
+            codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+            codec_ctx->get_format = get_hw_format;
+            DEBUG_LOG("VAAPI Hardware acceleration initialized successfully");
+        } else {
+            DEBUG_LOG("VAAPI Hardware acceleration creation failed — falling back to CPU decoding");
+        }
+    }
+
+    codec_ctx->width = w;
+    codec_ctx->height = h;
+    codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+
+    AVDictionary* opts = NULL;
+    av_dict_set(&opts, "threads", "auto", 0);
+    if (avcodec_open2(codec_ctx, codec, &opts) < 0) {
+        fprintf(stderr, "Error: Could not open libavcodec decoder\n");
+        av_dict_free(&opts);
+        avcodec_free_context(&codec_ctx);
+        codec_ctx = NULL;
+        return;
+    }
+    av_dict_free(&opts);
+
+    frame = av_frame_alloc();
+    sw_frame = av_frame_alloc();
+    pkt = av_packet_alloc();
     decoder_primed = 1;
-    init_decoder(width, height);
+    DEBUG_LOG("Decoder initialized successfully (size=%dx%d)", w, h);
 }
 
-static int decode_video(const uint8_t* data, int len, uint8_t* out_bgra, int width, int height) {
-    if (!codec_ctx) {
-        init_decoder(width, height);
-        if (!codec_ctx) return -1;
-    }
-    pkt->data = (uint8_t*)data;
+static void decode_video(const uint8_t* payload, int len, uint8_t* out_bgra, int w, int h) {
+    if (!decoder_primed || !codec_ctx) return;
+
+    pkt->data = (uint8_t*)payload;
     pkt->size = len;
 
     int ret = avcodec_send_packet(codec_ctx, pkt);
     if (ret < 0) {
         DEBUG_LOG("decode_video: avcodec_send_packet failed (ret=%d, len=%d)", ret, len);
-        return -1;
+        return;
     }
 
-    ret = avcodec_receive_frame(codec_ctx, frame);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        return 0;
-    } else if (ret < 0) {
-        DEBUG_LOG("decode_video: avcodec_receive_frame failed (ret=%d)", ret);
-        return -1;
-    }
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(codec_ctx, frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        } else if (ret < 0) {
+            DEBUG_LOG("decode_video: avcodec_receive_frame failed (ret=%d)", ret);
+            return;
+        }
 
-    AVFrame* src_frame = frame;
-    if (frame->format == hw_pix_fmt && hw_pix_fmt != AV_PIX_FMT_NONE) {
-        av_frame_unref(sw_frame);
-        int err = av_hwframe_transfer_data(sw_frame, frame, 0);
-        if (err >= 0) {
+        AVFrame* src_frame = frame;
+        if (frame->hw_frames_ctx) {
+            if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
+                DEBUG_LOG("decode_video: Failed to transfer VAAPI surface to CPU memory");
+                continue;
+            }
             src_frame = sw_frame;
         }
-    }
 
-    if (!sws_ctx || last_format != src_frame->format) {
+        if (src_frame->width != w || src_frame->height != h) {
+            continue;
+        }
+
+        enum AVPixelFormat fmt = src_frame->format;
+        if (!sws_ctx || last_format != fmt) {
+            if (sws_ctx) sws_freeContext(sws_ctx);
+            sws_ctx = sws_getContext(w, h, fmt, w, h, AV_PIX_FMT_BGRA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            last_format = fmt;
+        }
+
         if (sws_ctx) {
-            sws_freeContext(sws_ctx);
-        }
-        sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, src_frame->format,
-                                 width, height, AV_PIX_FMT_BGRA,
-                                 SWS_BILINEAR, NULL, NULL, NULL);
-        last_format = src_frame->format;
-    }
-
-    uint8_t* dest[4] = { out_bgra, NULL, NULL, NULL };
-    int dest_linesize[4] = { width * 4, 0, 0, 0 };
-
-    pthread_mutex_lock(&backbuffer_mutex);
-    sws_scale(sws_ctx, (const uint8_t *const *)src_frame->data, src_frame->linesize, 0, codec_ctx->height,
-              dest, dest_linesize);
-    pthread_mutex_unlock(&backbuffer_mutex);
-
-    return 1;
-}
-
-// JPEG Decoder utilizing libjpeg
-static int decode_jpeg(const uint8_t* jpeg_data, int jpeg_len, uint8_t* out_bgra, int rx, int ry, int rw, int rh, int screen_width) {
-    (void)rw;
-    (void)rh;
-    struct jpeg_decompress_struct cinfo;
-    struct jpeg_error_mgr jerr;
-
-    cinfo.err = jpeg_std_error(&jerr);
-    jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, jpeg_data, jpeg_len);
-
-    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
-        jpeg_destroy_decompress(&cinfo);
-        return -1;
-    }
-
-    cinfo.out_color_space = JCS_EXT_BGRX;
-    jpeg_start_decompress(&cinfo);
-
-    pthread_mutex_lock(&backbuffer_mutex);
-    while (cinfo.output_scanline < cinfo.output_height) {
-        int y = cinfo.output_scanline;
-        uint8_t* row_ptr = out_bgra + ((ry + y) * screen_width + rx) * 4;
-        JSAMPROW row_pointer[1] = { (JSAMPROW)row_ptr };
-        jpeg_read_scanlines(&cinfo, row_pointer, 1);
-    }
-    pthread_mutex_unlock(&backbuffer_mutex);
-
-    jpeg_finish_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
-    return 0;
-}
-
-// Hextile Decoder
-static int decode_hextile(int fd, uint8_t* out_bgra, int rx, int ry, int rw, int rh, int screen_width) {
-    uint32_t bg = 0xFFFFFFFF;
-    uint32_t fg = 0;
-    uint8_t subenc = 0;
-    
-    extern int read_exact(int fd, void* buf, size_t len);
-
-    for (int ty = ry; ty < ry + rh; ty += 16) {
-        int th = (ry + rh - ty < 16) ? (ry + rh - ty) : 16;
-        for (int tx = rx; tx < rx + rw; tx += 16) {
-            int tw = (rx + rw - tx < 16) ? (rx + rw - tx) : 16;
-
-            if (read_exact(fd, &subenc, 1) < 0) return -1;
-
-            if (subenc & 1) { // Raw
-                pthread_mutex_lock(&backbuffer_mutex);
-                for (int y = 0; y < th; y++) {
-                    size_t offset = ((ty + y) * (size_t)screen_width + tx) * 4;
-                    if (read_exact(fd, out_bgra + offset, (size_t)tw * 4) < 0) {
-                        pthread_mutex_unlock(&backbuffer_mutex);
-                        return -1;
-                    }
-                }
-                pthread_mutex_unlock(&backbuffer_mutex);
-            } else {
-                if (subenc & 2) { // BackgroundSpecified
-                    if (read_exact(fd, &bg, 4) < 0) return -1;
-                }
-                if (subenc & 4) { // ForegroundSpecified
-                    if (read_exact(fd, &fg, 4) < 0) return -1;
-                }
-
-                pthread_mutex_lock(&backbuffer_mutex);
-                for (int y = 0; y < th; y++) {
-                    uint32_t* row = (uint32_t*)out_bgra + (ty + y) * screen_width + tx;
-                    for (int x = 0; x < tw; x++) {
-                        row[x] = bg;
-                    }
-                }
-                pthread_mutex_unlock(&backbuffer_mutex);
-
-                if (subenc & 8) { // AnySubrects
-                    uint8_t num_subrects = 0;
-                    if (read_exact(fd, &num_subrects, 1) < 0) return -1;
-
-                    for (int i = 0; i < num_subrects; i++) {
-                        uint32_t color = fg;
-                        if (subenc & 16) { // SubrectsColoured
-                            if (read_exact(fd, &color, 4) < 0) return -1;
-                        }
-
-                        uint8_t pos = 0, size = 0;
-                        if (read_exact(fd, &pos, 1) < 0 || read_exact(fd, &size, 1) < 0) return -1;
-
-                        int sx = pos >> 4;
-                        int sy = pos & 0x0F;
-                        int sw = (size >> 4) + 1;
-                        int sh = (size & 0x0F) + 1;
-
-                        pthread_mutex_lock(&backbuffer_mutex);
-                        for (int y = 0; y < sh; y++) {
-                            uint32_t* row = (uint32_t*)out_bgra + (ty + sy + y) * screen_width + tx + sx;
-                            for (int x = 0; x < sw; x++) {
-                                row[x] = color;
-                            }
-                        }
-                        pthread_mutex_unlock(&backbuffer_mutex);
-                    }
-                }
-            }
+            uint8_t* dst[4] = { out_bgra, NULL, NULL, NULL };
+            int dst_stride[4] = { w * 4, 0, 0, 0 };
+            pthread_mutex_lock(&backbuffer_mutex);
+            sws_scale(sws_ctx, (const uint8_t* const*)src_frame->data, src_frame->linesize, 0, h, dst, dst_stride);
+            pthread_mutex_unlock(&backbuffer_mutex);
         }
     }
-    return 0;
 }
 
-int read_exact(int fd, void* buf, size_t len) {
-    size_t total = 0;
-    char* p = (char*)buf;
-    while (total < len) {
-        ssize_t n = recv(fd, p + total, len - total, 0);
-        if (n <= 0) return -1;
-        total += n;
+static void request_keyframe(void) {
+    if (vnc_fd < 0) return;
+    DEBUG_LOG("requesting keyframe from server...");
+    uint8_t msg = VNC_MSG_REQUEST_KEYFRAME;
+    send(vnc_fd, &msg, 1, 0);
+}
+
+static void udp_handle_setup(const uint8_t* payload) {
+    uint16_t port = ((uint16_t)payload[0] << 8) | payload[1];
+    memcpy(udp_cid, payload + 2, VNC_UDP_CID_LEN);
+    memcpy(udp_key, payload + 2 + VNC_UDP_CID_LEN, VNC_UDP_KEY_LEN);
+    uint8_t codec_id = payload[2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN];
+
+    if (udp_fd >= 0) {
+        close(udp_fd);
+        udp_fd = -1;
     }
-    return 0;
-}
 
-static void send_fb_request(int fd, uint8_t incremental, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
-    uint8_t buf[10];
-    buf[0] = 3;
-    buf[1] = incremental;
-    write_u16_be(buf + 2, x);
-    write_u16_be(buf + 4, y);
-    write_u16_be(buf + 6, w);
-    write_u16_be(buf + 8, h);
-    send(fd, buf, 10, 0);
-}
-
-// Send the RFB SetDesktopSize message (live resize request) — a single screen covering
-// the whole requested framebuffer, matching this server's single-display model.
-static void send_desktop_resize_request(int fd, uint16_t w, uint16_t h) {
-    uint8_t buf[8 + 16];
-    buf[0] = VNC_MSG_SET_DESKTOP_SIZE;
-    buf[1] = 0; // pad
-    write_u16_be(buf + 2, w);
-    write_u16_be(buf + 4, h);
-    buf[6] = 1; // number-of-screens
-    buf[7] = 0; // pad
-    write_u32_be(buf + 8, 0);  // screen id
-    write_u16_be(buf + 12, 0); // x
-    write_u16_be(buf + 14, 0); // y
-    write_u16_be(buf + 16, w);
-    write_u16_be(buf + 18, h);
-    write_u32_be(buf + 20, 0); // flags
-    send(fd, buf, sizeof(buf), 0);
-}
-
-// Fired VNC_RESIZE_DEBOUNCE_MS after the drawing area's size last changed (see
-// on_drawing_area_configure) — actually asks the server to resize the remote desktop.
-static gboolean send_resize_request_now(gpointer data) {
-    (void)data;
-    resize_debounce_source = 0;
-    // If the size already matches what we think the remote desktop is, there's nothing
-    // to request — this also suppresses the redundant round-trip that would otherwise
-    // happen when WE resize the window in response to the server's own confirmation
-    // (see apply_remote_desktop_size below).
-    if (vnc_fd >= 0 && (pending_resize_w != screen_w || pending_resize_h != screen_h) &&
-        pending_resize_w > 0 && pending_resize_h > 0) {
-        DEBUG_LOG("Requesting live desktop resize to %dx%d", pending_resize_w, pending_resize_h);
-        send_desktop_resize_request(vnc_fd, (uint16_t)pending_resize_w, (uint16_t)pending_resize_h);
+    udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd < 0) {
+        fprintf(stderr, "Error: Could not open UDP socket\n");
+        return;
     }
-    return FALSE; // one-shot
-}
 
-static gboolean on_drawing_area_configure(GtkWidget* widget, GdkEventConfigure* event, gpointer user_data) {
-    (void)widget;
-    (void)user_data;
-    if (vnc_fd < 0) return FALSE;
-    if (event->width == screen_w && event->height == screen_h) return FALSE;
+    memset(&udp_server_addr, 0, sizeof(udp_server_addr));
+    udp_server_addr.sin_family = AF_INET;
+    udp_server_addr.sin_port = htons(port);
+    udp_server_addr.sin_addr = udp_server_in_addr;
 
-    pending_resize_w = event->width;
-    pending_resize_h = event->height;
-    if (resize_debounce_source) {
-        g_source_remove(resize_debounce_source);
+    if (connect(udp_fd, (struct sockaddr*)&udp_server_addr, sizeof(udp_server_addr)) < 0) {
+        fprintf(stderr, "Error: UDP connect failed\n");
+        close(udp_fd);
+        udp_fd = -1;
+        return;
     }
-    resize_debounce_source = g_timeout_add(VNC_RESIZE_DEBOUNCE_MS, send_resize_request_now, NULL);
-    return FALSE;
+
+    int flags = fcntl(udp_fd, F_GETFL, 0);
+    fcntl(udp_fd, F_SETFL, flags | O_NONBLOCK);
+
+    active_video_codec_id = (codec_id == VNC_UDP_CODEC_VP9) ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
+    reset_decoder(screen_w, screen_h);
+
+    udp_send_ctr = 0;
+    memset(&udp_recv_replay, 0, sizeof(udp_recv_replay));
+    udp_last_heartbeat_ms = 0;
+    udp_last_keyframe_request_ms = 0;
+    udp_active = 1;
+
+    reasm_active = 0;
+    have_last_completed_frame = 0;
+
+    DEBUG_LOG("UDP encrypted side-channel established successfully with CID=%02X%02X%02X%02X%02X%02X%02X%02X on port %d (codec=%d)",
+              udp_cid[0], udp_cid[1], udp_cid[2], udp_cid[3],
+              udp_cid[4], udp_cid[5], udp_cid[6], udp_cid[7],
+              port, codec_id);
 }
 
-// Drawing area callbacks
-static gboolean on_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data) {
-    (void)widget;
-    (void)user_data;
-    if (!backbuffer) return FALSE;
+static void reasm_start(uint32_t frame_id, uint16_t frag_count) {
+    reasm_active = 1;
+    reasm_frame_id = frame_id;
+    reasm_frag_count = frag_count;
+    reasm_frags_got = 0;
+    reasm_last_frag_len = 0;
+    reasm_flags = 0;
+    reasm_start_ms = vv_now_ms();
 
-    pthread_mutex_lock(&backbuffer_mutex);
-    cairo_surface_t* surface = cairo_image_surface_create_for_data(
-        backbuffer, CAIRO_FORMAT_RGB24, screen_w, screen_h, screen_w * 4);
-    cairo_set_source_surface(cr, surface, 0, 0);
-    cairo_paint(cr);
-    cairo_surface_destroy(surface);
-
-    if (waiting_for_draw && vnc_fd >= 0) {
-        waiting_for_draw = 0;
-        send_fb_request(vnc_fd, 1, 0, 0, screen_w, screen_h);
+    size_t req = (size_t)frag_count * VNC_UDP_MAX_FRAG_PAYLOAD;
+    if (req > reasm_buf_cap) {
+        reasm_buf_cap = req;
+        reasm_buf = realloc(reasm_buf, reasm_buf_cap);
     }
-    pthread_mutex_unlock(&backbuffer_mutex);
-
-    return FALSE;
-}
-
-static void send_pointer(double x, double y, uint8_t mask) {
-    if (vnc_fd >= 0) {
-        uint8_t buf[6];
-        buf[0] = 5; 
-        buf[1] = mask;
-        write_u16_be(buf + 2, (uint16_t)x);
-        write_u16_be(buf + 4, (uint16_t)y);
-        send(vnc_fd, buf, 6, 0);
-    }
-}
-
-static gboolean on_motion(GtkWidget* widget, GdkEventMotion* event, gpointer user_data) {
-    (void)widget;
-    (void)user_data;
-    send_pointer(event->x, event->y, button_mask);
-    return TRUE;
-}
-
-static gboolean on_button(GtkWidget* widget, GdkEventButton* event, gpointer user_data) {
-    (void)widget;
-    (void)user_data;
-    int down = (event->type == GDK_BUTTON_PRESS) ? 1 : 0;
-    int button = event->button;
-    if (button == 1) {
-        if (down) button_mask |= 1; else button_mask &= ~1;
-    } else if (button == 2) {
-        if (down) button_mask |= 2; else button_mask &= ~2;
-    } else if (button == 3) {
-        if (down) button_mask |= 4; else button_mask &= ~4;
-    }
-    send_pointer(event->x, event->y, button_mask);
-    return TRUE;
-}
-
-static gboolean on_scroll(GtkWidget* widget, GdkEventScroll* event, gpointer user_data) {
-    (void)widget;
-    (void)user_data;
-    uint8_t mask = button_mask;
-    if (event->direction == GDK_SCROLL_UP) {
-        mask |= 8;
-        send_pointer(event->x, event->y, mask);
-        mask &= ~8;
-        send_pointer(event->x, event->y, mask);
-    } else if (event->direction == GDK_SCROLL_DOWN) {
-        mask |= 16;
-        send_pointer(event->x, event->y, mask);
-        mask &= ~16;
-        send_pointer(event->x, event->y, mask);
-    }
-    return TRUE;
-}
-
-static void send_key(uint8_t down, uint32_t keysym) {
-    if (vnc_fd >= 0) {
-        uint8_t buf[8];
-        buf[0] = 4; 
-        buf[1] = down;
-        buf[2] = 0;
-        buf[3] = 0;
-        write_u32_be(buf + 4, keysym);
-        send(vnc_fd, buf, 8, 0);
-    }
-}
-
-static gboolean on_key_event(GtkWidget* widget, GdkEventKey* event, gpointer user_data) {
-    (void)widget;
-    (void)user_data;
-    int down = (event->type == GDK_KEY_PRESS) ? 1 : 0;
-    send_key(down, event->keyval);
-    return TRUE;
+    memset(reasm_got_bitmap, 0, sizeof(reasm_got_bitmap));
 }
 
 static gboolean queue_draw_idle(gpointer data) {
     (void)data;
-    gtk_widget_queue_draw(drawing_area);
-    return FALSE;
-}
-
-static gboolean destroy_widget_idle(gpointer data) {
-    if (data && data == viewer_window) {
-        gtk_widget_destroy(GTK_WIDGET(viewer_window));
-        viewer_window = NULL;
-    }
-    return FALSE;
-}
-
-// Reflect a server-confirmed desktop resize (screen_w/screen_h must already be updated
-// by the caller) in the actual GTK window. Must run on the main thread — scheduled via
-// g_idle_add from the network thread.
-static gboolean apply_remote_desktop_size_idle(gpointer data) {
-    (void)data;
-    if (viewer_window) {
-        gtk_window_resize(GTK_WINDOW(viewer_window), screen_w, screen_h);
-    }
     if (drawing_area) {
         gtk_widget_queue_draw(drawing_area);
     }
     return FALSE;
 }
 
-// Ask the server for a fresh IDR keyframe (rate-limited). Used to recover quickly from
-// UDP packet/frame loss rather than waiting for the encoder's periodic GOP boundary.
-static void request_keyframe(void) {
-    unsigned long long now = vv_now_ms();
-    if (now - udp_last_keyframe_request_ms < 500) return;
-    udp_last_keyframe_request_ms = now;
-    if (vnc_fd >= 0) {
-        DEBUG_LOG("request_keyframe: asking server for a fresh IDR");
-        uint8_t msg = VNC_MSG_REQUEST_KEYFRAME;
-        send(vnc_fd, &msg, 1, 0);
-    }
-}
-
-// Send an authenticated Hello/heartbeat datagram: opens the NAT mapping on first send and
-// keeps it (and the server's liveness timer) alive afterwards.
-static void udp_send_hello(void) {
-    if (udp_fd < 0) return;
-    uint8_t out[VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN];
-    int len = udp_seal(udp_key, VNC_UDP_TYPE_HELLO, udp_cid, udp_send_ctr++, NULL, 0, out, sizeof(out));
-    if (len > 0) {
-        sendto(udp_fd, out, (size_t)len, 0, (struct sockaddr*)&udp_server_addr, sizeof(udp_server_addr));
-    }
-    udp_last_heartbeat_ms = vv_now_ms();
-}
-
-// Handle the one-time VNC_ENCODING_UDP_SETUP rectangle: sets up the local UDP socket + key
-// and immediately punches a Hello through to the server.
-static void udp_handle_setup(const uint8_t* payload) {
-    uint16_t port = read_u16_be(payload);
-    memcpy(udp_cid, payload + 2, VNC_UDP_CID_LEN);
-    memcpy(udp_key, payload + 2 + VNC_UDP_CID_LEN, VNC_UDP_KEY_LEN);
-    uint8_t codec_byte = payload[2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN];
-    active_video_codec_id = (codec_byte == VNC_UDP_CODEC_VP9) ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
-    DEBUG_LOG("udp_handle_setup: server port=%u codec=%s cid=%02x%02x%02x%02x%02x%02x%02x%02x",
-              port, codec_byte == VNC_UDP_CODEC_VP9 ? "VP9" : "H.264",
-              udp_cid[0], udp_cid[1], udp_cid[2], udp_cid[3],
-              udp_cid[4], udp_cid[5], udp_cid[6], udp_cid[7]);
-
-    if (udp_fd < 0) {
-        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (udp_fd >= 0) {
-            // A generous receive buffer reduces the odds of the kernel dropping fragments
-            // during a burst (e.g. a keyframe's worth of datagrams arriving back-to-back)
-            // if this thread is briefly descheduled; see VNC_UDP_REASM_TIMEOUT_MS for the
-            // self-healing fallback when a fragment is lost anyway.
-            int rcvbuf = 4 * 1024 * 1024;
-            setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-        }
-    }
-    memset(&udp_server_addr, 0, sizeof(udp_server_addr));
-    udp_server_addr.sin_family = AF_INET;
-    udp_server_addr.sin_port = htons(port);
-    udp_server_addr.sin_addr = udp_server_in_addr;
-
-    udp_send_ctr = 0;
-    udp_recv_replay.highest = 0;
-    udp_recv_replay.bitmap = 0;
-    reasm_active = 0;
-    have_last_completed_frame = 0;
-
-    if (udp_fd >= 0) {
-        udp_active = 1;
-        udp_send_hello();
-    }
-}
-
-static void reasm_start(uint32_t frame_id, uint16_t frag_count) {
-    size_t needed = (size_t)frag_count * VNC_UDP_MAX_FRAG_PAYLOAD;
-    if (needed > reasm_buf_cap) {
-        uint8_t* new_buf = realloc(reasm_buf, needed);
-        if (!new_buf) return; // drop this frame; we'll pick up the next one
-        reasm_buf = new_buf;
-        reasm_buf_cap = needed;
-    }
-    memset(reasm_got_bitmap, 0, sizeof(reasm_got_bitmap));
-    reasm_frame_id = frame_id;
-    reasm_frag_count = frag_count;
-    reasm_frags_got = 0;
-    reasm_last_frag_len = 0;
-    reasm_start_ms = vv_now_ms();
-    reasm_active = 1;
-}
-
-// Process one authenticated+decrypted VIDEO payload (inner header + fragment bytes).
 static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
     if (pt_len < VNC_UDP_INNER_HDR_LEN) return;
 
-    uint32_t frame_id = read_u32_be(pt);
-    uint16_t frag_idx = read_u16_be(pt + 4);
-    uint16_t frag_count = read_u16_be(pt + 6);
-    uint8_t flags = pt[8];
-    int frag_len = pt_len - VNC_UDP_INNER_HDR_LEN;
+    uint32_t frame_id = ((uint32_t)pt[0] << 24) | ((uint32_t)pt[1] << 16) | ((uint32_t)pt[2] << 8) | pt[3];
+    uint16_t frag_count = ((uint16_t)pt[4] << 8) | pt[5];
+    uint16_t frag_idx = ((uint16_t)pt[6] << 8) | pt[7];
+    uint16_t frag_len = ((uint16_t)pt[8] << 8) | pt[9];
+    uint8_t flags = pt[4] & 0x03; 
 
-    if (frag_count == 0 || frag_count > VNC_UDP_MAX_FRAGS || frag_idx >= frag_count) return;
+    if (frag_idx >= frag_count || frag_len > VNC_UDP_MAX_FRAG_PAYLOAD || pt_len < VNC_UDP_INNER_HDR_LEN + frag_len) return;
 
-    if (!reasm_active || frame_id != reasm_frame_id) {
-        // A new frame started before the previous one finished (or this is simply the
-        // first frame seen) — dropping the stale partial frame is the right call for
-        // latency, but it also means we lost data, so ask for a keyframe to recover.
-        if (reasm_active && reasm_frags_got < reasm_frag_count) {
-            DEBUG_LOG("reasm: abandoning frame %u at %u/%u fragments (frame %u arrived early)",
-                      reasm_frame_id, reasm_frags_got, reasm_frag_count, frame_id);
+    if (!reasm_active || frame_id > reasm_frame_id) {
+        if (have_last_completed_frame && frame_id <= last_completed_frame_id) return;
+
+        if (reasm_active) {
+            DEBUG_LOG("reasm: abandoning incomplete frame %u in favor of new frame %u", reasm_frame_id, frame_id);
             request_keyframe();
         }
         if (have_last_completed_frame && frame_id != last_completed_frame_id + 1) {
@@ -942,8 +574,6 @@ static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
     }
 }
 
-// Drain all pending datagrams on udp_fd and feed authenticated VIDEO payloads to the
-// frame reassembler. Bounded so one call can't monopolize the network thread.
 static void udp_drain(void) {
     uint8_t buf[VNC_UDP_MAX_DATAGRAM];
     uint8_t plaintext[VNC_UDP_MAX_DATAGRAM];
@@ -952,7 +582,7 @@ static void udp_drain(void) {
         ssize_t n = recvfrom(udp_fd, buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL);
         if (n <= 0) return;
         if (n < VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN) continue;
-        if (buf[0] != VNC_UDP_TYPE_VIDEO) continue; // only the server sends VIDEO datagrams
+        if (buf[0] != VNC_UDP_TYPE_VIDEO) continue;
         if (memcmp(buf + 1, udp_cid, VNC_UDP_CID_LEN) != 0) continue;
 
         uint8_t type = 0;
@@ -971,11 +601,6 @@ static void udp_drain(void) {
     }
 }
 
-// Give up on a frame whose fragments stopped arriving. Without this, a single dropped
-// UDP datagram would stall the reassembler forever — and since the client only sends its
-// next FramebufferUpdateRequest after decoding+drawing a frame (see on_draw), the server
-// would then have nothing left to prompt it to keep sending. Abandoning the frame, asking
-// for a keyframe, and re-arming the request ourselves keeps the stream self-healing.
 static void reasm_check_timeout(void) {
     if (!reasm_active) return;
     if (vv_now_ms() - reasm_start_ms < VNC_UDP_REASM_TIMEOUT_MS) return;
@@ -985,21 +610,16 @@ static void reasm_check_timeout(void) {
     reasm_active = 0;
     request_keyframe();
     if (vnc_fd >= 0) {
-        send_fb_request(vnc_fd, 1, 0, 0, screen_w, screen_h);
+        vnc_core_send_fb_request(1, 0, 0, screen_w, screen_h);
     }
 }
-
-static char* last_sent_clipboard = NULL;
 
 static gboolean apply_server_clipboard_idle(gpointer data) {
     char* text = (char*)data;
     if (text) {
         GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-        
-        // Update our last_sent_clipboard cache to prevent feedback loops
         free(last_sent_clipboard);
         last_sent_clipboard = strdup(text);
-        
         gtk_clipboard_set_text(clipboard, text, -1);
         free(text);
     }
@@ -1010,28 +630,14 @@ static void on_clipboard_text_received(GtkClipboard* clipboard, const char* text
     (void)clipboard;
     (void)user_data;
     if (text && vnc_fd >= 0) {
-        // Prevent feedback loop
         if (last_sent_clipboard && strcmp(last_sent_clipboard, text) == 0) {
             return;
         }
-        
         free(last_sent_clipboard);
         last_sent_clipboard = strdup(text);
         
         int len = strlen(text);
-        if (len > 0) {
-            uint8_t* buf = malloc(8 + (size_t)len);
-            if (buf) {
-                buf[0] = 6; // ClientCutText
-                buf[1] = 0;
-                buf[2] = 0;
-                buf[3] = 0;
-                write_u32_be(buf + 4, (uint32_t)len);
-                memcpy(buf + 8, text, (size_t)len);
-                send(vnc_fd, buf, 8 + (size_t)len, 0);
-                free(buf);
-            }
-        }
+        vnc_core_send_clipboard(text, len);
     }
 }
 
@@ -1041,240 +647,55 @@ static void on_clipboard_owner_change(GtkClipboard* clipboard, GdkEvent* event, 
     gtk_clipboard_request_text(clipboard, on_clipboard_text_received, NULL);
 }
 
+static gboolean destroy_widget_idle(gpointer data) {
+    gtk_widget_destroy(GTK_WIDGET(data));
+    return FALSE;
+}
+
 // Background network client loop thread (after handshake is complete)
 static void* vnc_client_thread(void* arg) {
     (void)arg;
     int fd = vnc_fd;
-    int w = screen_w;
-    int h = screen_h;
 
-    // Send SetEncodings
-    uint8_t encs_msg[128];
-    encs_msg[0] = 2; 
-    encs_msg[1] = 0;
-
-    int num_encs = 0;
-    if (strcmp(preferred_encoding, "h264") == 0) {
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 50); // H.264
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, VNC_ENCODING_UDP_SETUP); // opt into the UDP transport
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 7);  // Tight (JPEG)
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 5);  // Hextile
-    } else if (strcmp(preferred_encoding, "vp9") == 0) {
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, VNC_ENCODING_VP9); // VP9
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, VNC_ENCODING_UDP_SETUP); // opt into the UDP transport
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 7);  // Tight (JPEG)
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 5);  // Hextile
-    } else if (strcmp(preferred_encoding, "jpeg") == 0) {
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 7);  // Tight
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 5);  // Hextile
-    } else if (strcmp(preferred_encoding, "hextile") == 0) {
-        write_u32_be(encs_msg + 4 + (num_encs++) * 4, 5);  // Hextile
-    }
-    write_u32_be(encs_msg + 4 + (num_encs++) * 4, 0); // Raw fallback
-    // Live desktop resize is orthogonal to the pixel encoding, so it's always advertised.
-    write_u32_be(encs_msg + 4 + (num_encs++) * 4, (uint32_t)VNC_ENCODING_EXT_DESKTOP_SIZE);
-    write_u16_be(encs_msg + 2, num_encs);
-
-    DEBUG_LOG("SetEncodings: sending %d encodings (preferred=%s)", num_encs, preferred_encoding);
-    send(fd, encs_msg, 4 + (size_t)num_encs * 4, 0);
-
-    // Initial frame request
-    send_fb_request(fd, 0, 0, 0, w, h);
-
-    client_running = 1;
     while (client_running) {
         struct pollfd pfds[2];
         pfds[0].fd = fd;
         pfds[0].events = POLLIN;
         pfds[0].revents = 0;
-        pfds[1].fd = udp_fd; // may be -1 until the UDP setup rect arrives; poll() ignores that
+        pfds[1].fd = udp_fd;
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
 
-        // Bounded wait (rather than blocking indefinitely) so the heartbeat and stuck-frame
-        // reassembly timeout are both serviced promptly even when idle.
         int pr = poll(pfds, 2, 200);
         if (pr < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        if (udp_active && vv_now_ms() - udp_last_heartbeat_ms >= VNC_UDP_HEARTBEAT_INTERVAL_MS) {
-            udp_send_hello();
-        }
-
-        if (pfds[1].revents & POLLIN) {
-            udp_drain();
-        }
-
         if (udp_active) {
+            udp_drain();
             reasm_check_timeout();
-        }
 
-        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
-        if (!(pfds[0].revents & POLLIN)) continue;
-
-        uint8_t msg_type = 0;
-        if (recv(fd, &msg_type, 1, 0) <= 0) break;
-
-        if (msg_type == 0) { // FramebufferUpdate
-            uint8_t pad;
-            uint16_t num_rects;
-            if (read_exact(fd, &pad, 1) < 0 || read_exact(fd, &num_rects, 2) < 0) break;
-            num_rects = read_u16_be((uint8_t*)&num_rects);
-
-            for (int i = 0; i < num_rects; i++) {
-                uint16_t rx, ry, rw, rh;
-                uint32_t encoding;
-                if (read_exact(fd, &rx, 2) < 0 || read_exact(fd, &ry, 2) < 0 ||
-                    read_exact(fd, &rw, 2) < 0 || read_exact(fd, &rh, 2) < 0 ||
-                    read_exact(fd, &encoding, 4) < 0) goto exit_thread;
-
-                rx = read_u16_be((uint8_t*)&rx);
-                ry = read_u16_be((uint8_t*)&ry);
-                rw = read_u16_be((uint8_t*)&rw);
-                rh = read_u16_be((uint8_t*)&rh);
-                encoding = read_u32_be((uint8_t*)&encoding);
-
-                if (encoding == 0) { // Raw
-                    pthread_mutex_lock(&backbuffer_mutex);
-                    for (int y = 0; y < rh; y++) {
-                        size_t offset = ((ry + y) * (size_t)w + rx) * 4;
-                        if (read_exact(fd, backbuffer + offset, (size_t)rw * 4) < 0) {
-                            pthread_mutex_unlock(&backbuffer_mutex);
-                            goto exit_thread;
-                        }
-                    }
-                    pthread_mutex_unlock(&backbuffer_mutex);
-                } 
-                else if (encoding == 5) { // Hextile
-                    if (decode_hextile(fd, backbuffer, rx, ry, rw, rh, w) < 0) goto exit_thread;
+            // Heartbeat
+            unsigned long long now = vv_now_ms();
+            if (now - udp_last_heartbeat_ms >= VNC_UDP_HEARTBEAT_INTERVAL_MS) {
+                uint8_t payload[1] = { 0 }; 
+                uint8_t cipher[VNC_UDP_MAX_DATAGRAM];
+                int cipher_len = udp_seal(udp_key, VNC_UDP_TYPE_HELLO, udp_cid, ++udp_send_ctr, payload, 0, cipher, sizeof(cipher));
+                if (cipher_len > 0 && udp_fd >= 0) {
+                    sendto(udp_fd, cipher, (size_t)cipher_len, 0, (struct sockaddr*)&udp_server_addr, sizeof(udp_server_addr));
                 }
-                else if (encoding == 7) { // Tight (JPEG)
-                    uint8_t comp_byte = 0;
-                    if (read_exact(fd, &comp_byte, 1) < 0) goto exit_thread;
-
-                    uint32_t jpeg_size = 0;
-                    uint8_t b1 = 0;
-                    if (read_exact(fd, &b1, 1) < 0) goto exit_thread;
-                    if (b1 < 128) {
-                        jpeg_size = b1;
-                    } else {
-                        uint8_t b2 = 0;
-                        if (read_exact(fd, &b2, 1) < 0) goto exit_thread;
-                        if (b2 < 128) {
-                            jpeg_size = (b1 & 0x7F) | ((uint32_t)b2 << 7);
-                        } else {
-                            uint8_t b3 = 0;
-                            if (read_exact(fd, &b3, 1) < 0) goto exit_thread;
-                            jpeg_size = (b1 & 0x7F) | ((uint32_t)(b2 & 0x7F) << 7) | ((uint32_t)b3 << 14);
-                        }
-                    }
-
-                    uint8_t* jpeg_data = malloc(jpeg_size);
-                    if (read_exact(fd, jpeg_data, jpeg_size) < 0) {
-                        free(jpeg_data);
-                        goto exit_thread;
-                    }
-
-                    decode_jpeg(jpeg_data, jpeg_size, backbuffer, rx, ry, rw, rh, w);
-                    free(jpeg_data);
-                }
-                else if (encoding == 50 || encoding == VNC_ENCODING_VP9) { // H.264 / VP9
-                    active_video_codec_id = (encoding == VNC_ENCODING_VP9) ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
-                    uint32_t length = 0;
-                    uint32_t flags = 0;
-                    if (read_exact(fd, &length, 4) < 0 || read_exact(fd, &flags, 4) < 0) goto exit_thread;
-                    length = read_u32_be((uint8_t*)&length);
-                    flags = read_u32_be((uint8_t*)&flags);
-
-                    uint8_t* payload = malloc(length);
-                    if (read_exact(fd, payload, length) < 0) {
-                        free(payload);
-                        goto exit_thread;
-                    }
-
-                    if (flags & 2) {
-                        reset_decoder(w, h);
-                    }
-
-                    if (decoder_primed && length > 0) {
-                        decode_video(payload, length, backbuffer, w, h);
-                    }
-                    free(payload);
-                }
-                else if (encoding == VNC_ENCODING_UDP_SETUP) {
-                    uint8_t setup_payload[VNC_UDP_SETUP_PAYLOAD_LEN];
-                    if (read_exact(fd, setup_payload, sizeof(setup_payload)) < 0) goto exit_thread;
-                    udp_handle_setup(setup_payload);
-                }
-                else if (encoding == (uint32_t)VNC_ENCODING_EXT_DESKTOP_SIZE) {
-                    // rx = reason (0=generic/initial, 1=our own request, 2=another client's
-                    // request), ry = status (0=success, nonzero=one of the RFB error codes).
-                    // rw/rh = the framebuffer size this applies to.
-                    uint8_t eds_hdr[4];
-                    if (read_exact(fd, eds_hdr, 4) < 0) goto exit_thread;
-                    uint8_t num_screens = eds_hdr[0];
-                    size_t screens_len = (size_t)num_screens * 16;
-                    if (screens_len > 0) {
-                        uint8_t* screens_buf = malloc(screens_len);
-                        // We only act on the overall framebuffer size (rw/rh); the
-                        // per-screen layout list isn't meaningful for this single-window
-                        // client, so it's read only to stay in sync with the stream.
-                        if (read_exact(fd, screens_buf, screens_len) < 0) {
-                            free(screens_buf);
-                            goto exit_thread;
-                        }
-                        free(screens_buf);
-                    }
-
-                    DEBUG_LOG("ExtendedDesktopSize: reason=%u status=%u size=%ux%u", rx, ry, rw, rh);
-
-                    if (ry == VNC_EDS_STATUS_SUCCESS && rw > 0 && rh > 0 && (rw != screen_w || rh != screen_h)) {
-                        pthread_mutex_lock(&backbuffer_mutex);
-                        backbuffer = realloc(backbuffer, (size_t)rw * rh * 4);
-                        memset(backbuffer, 0, (size_t)rw * rh * 4);
-                        screen_w = rw;
-                        screen_h = rh;
-                        pthread_mutex_unlock(&backbuffer_mutex);
-
-                        // w/h are this thread's own locals used for every decode_video()
-                        // call below — the server always follows this notification with a
-                        // forced keyframe at the new size, so the next reset_decoder() call
-                        // will (re)init at the right dimensions as long as these are
-                        // updated first.
-                        w = rw;
-                        h = rh;
-
-                        g_idle_add(apply_remote_desktop_size_idle, NULL);
-                    }
-                }
+                udp_last_heartbeat_ms = now;
             }
-
-            pthread_mutex_lock(&backbuffer_mutex);
-            waiting_for_draw = 1;
-            pthread_mutex_unlock(&backbuffer_mutex);
-
-            g_idle_add((GSourceFunc)queue_draw_idle, NULL);
         }
-        else if (msg_type == 3) { // ServerCutText
-            uint8_t pad[3];
-            uint32_t length;
-            if (read_exact(fd, pad, 3) < 0 || read_exact(fd, &length, 4) < 0) break;
-            length = read_u32_be((uint8_t*)&length);
-            
-            char* text = malloc(length + 1);
-            if (read_exact(fd, text, length) < 0) {
-                free(text);
+
+        if (pfds[0].revents & POLLIN) {
+            if (vnc_core_process_message(fd) < 0) {
                 break;
             }
-            text[length] = '\0';
-            
-            g_idle_add(apply_server_clipboard_idle, text);
         }
     }
 
-exit_thread:
     DEBUG_LOG("vnc_client_thread: exiting (connection closed or fatal read error)");
     client_running = 0;
     vnc_fd = -1;
@@ -1284,7 +705,7 @@ exit_thread:
         udp_fd = -1;
     }
     udp_active = 0;
-    memset(udp_key, 0, sizeof(udp_key)); // don't leave session key material lying around
+    memset(udp_key, 0, sizeof(udp_key));
     free(reasm_buf);
     reasm_buf = NULL;
     reasm_buf_cap = 0;
@@ -1334,53 +755,441 @@ static void on_viewer_destroy(void) {
 }
 
 // Dialog helper to request password on the main thread
-static char* prompt_password(GtkWindow* parent) {
+static char* prompt_password(void) {
     GtkWidget* dialog = gtk_dialog_new_with_buttons("VNC Authentication Required",
-                                                    parent,
+                                                    GTK_WINDOW(main_window),
                                                     GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
                                                     "_Cancel", GTK_RESPONSE_CANCEL,
                                                     "_OK", GTK_RESPONSE_OK,
                                                     NULL);
     GtkWidget* content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    
-    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_container_set_border_width(GTK_CONTAINER(vbox), 12);
-    gtk_container_add(GTK_CONTAINER(content_area), vbox);
-    
-    GtkWidget* label = gtk_label_new("This VNC server requires password authentication:");
-    gtk_widget_set_halign(label, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
-    
+    GtkWidget* label = gtk_label_new("Enter password to connect to server:");
     GtkWidget* entry = gtk_entry_new();
-    gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE); // Mask character entry
+    gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE);
     gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
-    gtk_box_pack_start(GTK_BOX(vbox), entry, FALSE, FALSE, 0);
-    
-    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+
+    gtk_container_add(GTK_CONTAINER(content_area), label);
+    gtk_container_add(GTK_CONTAINER(content_area), entry);
     gtk_widget_show_all(dialog);
-    
-    char* password_ret = NULL;
-    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
-    if (response == GTK_RESPONSE_OK) {
-        password_ret = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
+
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+
+    char* result = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        result = strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
     }
+    gtk_widget_destroy(dialog);
+    return result;
+}
+
+// UI Event Handlers
+static gboolean on_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    pthread_mutex_lock(&backbuffer_mutex);
+    if (!backbuffer || screen_w <= 0 || screen_h <= 0) {
+        pthread_mutex_unlock(&backbuffer_mutex);
+        cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+        cairo_paint(cr);
+        return TRUE;
+    }
+
+    cairo_surface_t* surface = cairo_image_surface_create_for_data(backbuffer,
+                                                                  CAIRO_FORMAT_RGB24,
+                                                                  screen_w, screen_h,
+                                                                  screen_w * 4);
     
-    gtk_widget_destroy(dialog);
-    return password_ret;
+    // Clear background to sleek dark color
+    cairo_set_source_rgb(cr, 0.05, 0.05, 0.05);
+    cairo_paint(cr);
+
+    // Compute center scaling
+    int win_w = gtk_widget_get_allocated_width(drawing_area);
+    int win_h = gtk_widget_get_allocated_height(drawing_area);
+    double scale_x = (double)win_w / screen_w;
+    double scale_y = (double)win_h / screen_h;
+    double scale = (scale_x < scale_y) ? scale_x : scale_y;
+
+    double dx = (win_w - screen_w * scale) / 2.0;
+    double dy = (win_h - screen_h * scale) / 2.0;
+
+    cairo_save(cr);
+    cairo_translate(cr, dx, dy);
+    cairo_scale(cr, scale, scale);
+
+    cairo_set_source_surface(cr, surface, 0, 0);
+    cairo_paint(cr);
+    cairo_restore(cr);
+
+    cairo_surface_destroy(surface);
+    waiting_for_draw = 0;
+    pthread_mutex_unlock(&backbuffer_mutex);
+    return TRUE;
 }
 
-static void show_error_dialog(GtkWindow* parent, const char* message) {
-    GtkWidget* dialog = gtk_message_dialog_new(parent,
-                                               GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                               GTK_MESSAGE_ERROR,
-                                               GTK_BUTTONS_OK,
-                                               "%s", message);
-    gtk_window_set_title(GTK_WINDOW(dialog), "VNC Connection Error");
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+static gboolean on_motion(GtkWidget* widget, GdkEventMotion* event, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    if (vnc_fd < 0 || screen_w <= 0 || screen_h <= 0) return TRUE;
+
+    int win_w = gtk_widget_get_allocated_width(drawing_area);
+    int win_h = gtk_widget_get_allocated_height(drawing_area);
+    double scale_x = (double)win_w / screen_w;
+    double scale_y = (double)win_h / screen_h;
+    double scale = (scale_x < scale_y) ? scale_x : scale_y;
+    double dx = (win_w - screen_w * scale) / 2.0;
+    double dy = (win_h - screen_h * scale) / 2.0;
+
+    double rx = (event->x - dx) / scale;
+    double ry = (event->y - dy) / scale;
+
+    if (rx < 0) rx = 0;
+    if (rx >= screen_w) rx = screen_w - 1;
+    if (ry < 0) ry = 0;
+    if (ry >= screen_h) ry = screen_h - 1;
+
+    vnc_core_send_pointer((uint16_t)rx, (uint16_t)ry, button_mask);
+    return TRUE;
 }
 
-// Perform VNC socket connect and initial handshake synchronously on GUI thread
+static gboolean on_button(GtkWidget* widget, GdkEventButton* event, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    if (vnc_fd < 0 || screen_w <= 0 || screen_h <= 0) return TRUE;
+
+    if (event->type == GDK_BUTTON_PRESS || event->type == GDK_BUTTON_RELEASE) {
+        uint8_t mask = 0;
+        if (event->button == GDK_BUTTON_PRIMARY) mask = 1;
+        else if (event->button == GDK_BUTTON_MIDDLE) mask = 2;
+        else if (event->button == GDK_BUTTON_SECONDARY) mask = 4;
+
+        if (event->type == GDK_BUTTON_PRESS) {
+            button_mask |= mask;
+        } else {
+            button_mask &= ~mask;
+        }
+
+        int win_w = gtk_widget_get_allocated_width(drawing_area);
+        int win_h = gtk_widget_get_allocated_height(drawing_area);
+        double scale_x = (double)win_w / screen_w;
+        double scale_y = (double)win_h / screen_h;
+        double scale = (scale_x < scale_y) ? scale_x : scale_y;
+        double dx = (win_w - screen_w * scale) / 2.0;
+        double dy = (win_h - screen_h * scale) / 2.0;
+
+        double rx = (event->x - dx) / scale;
+        double ry = (event->y - dy) / scale;
+
+        if (rx < 0) rx = 0;
+        if (rx >= screen_w) rx = screen_w - 1;
+        if (ry < 0) ry = 0;
+        if (ry >= screen_h) ry = screen_h - 1;
+
+        vnc_core_send_pointer((uint16_t)rx, (uint16_t)ry, button_mask);
+    }
+    return TRUE;
+}
+
+static gboolean on_scroll(GtkWidget* widget, GdkEventScroll* event, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    if (vnc_fd < 0 || screen_w <= 0 || screen_h <= 0) return TRUE;
+
+    uint8_t temp_mask = button_mask;
+    if (event->direction == GDK_SCROLL_UP) temp_mask |= 8;
+    else if (event->direction == GDK_SCROLL_DOWN) temp_mask |= 16;
+    else if (event->direction == GDK_SCROLL_LEFT) temp_mask |= 32;
+    else if (event->direction == GDK_SCROLL_RIGHT) temp_mask |= 64;
+
+    int win_w = gtk_widget_get_allocated_width(drawing_area);
+    int win_h = gtk_widget_get_allocated_height(drawing_area);
+    double scale_x = (double)win_w / screen_w;
+    double scale_y = (double)win_h / screen_h;
+    double scale = (scale_x < scale_y) ? scale_x : scale_y;
+    double dx = (win_w - screen_w * scale) / 2.0;
+    double dy = (win_h - screen_h * scale) / 2.0;
+
+    double rx = (event->x - dx) / scale;
+    double ry = (event->y - dy) / scale;
+
+    if (rx < 0) rx = 0;
+    if (rx >= screen_w) rx = screen_w - 1;
+    if (ry < 0) ry = 0;
+    if (ry >= screen_h) ry = screen_h - 1;
+
+    vnc_core_send_pointer((uint16_t)rx, (uint16_t)ry, temp_mask);
+    vnc_core_send_pointer((uint16_t)rx, (uint16_t)ry, button_mask);
+    return TRUE;
+}
+
+static guint map_gdk_keyval_to_keysym(guint keyval) {
+    if (keyval >= GDK_KEY_KP_Space && keyval <= GDK_KEY_KP_9) {
+        switch (keyval) {
+            case GDK_KEY_KP_Space: return 0xFF80;
+            case GDK_KEY_KP_Tab: return 0xFF89;
+            case GDK_KEY_KP_Enter: return 0xFF8D;
+            case GDK_KEY_KP_F1: return 0xFF91;
+            case GDK_KEY_KP_F2: return 0xFF92;
+            case GDK_KEY_KP_F3: return 0xFF93;
+            case GDK_KEY_KP_F4: return 0xFF94;
+            case GDK_KEY_KP_Home: return 0xFF95;
+            case GDK_KEY_KP_Left: return 0xFF96;
+            case GDK_KEY_KP_Up: return 0xFF97;
+            case GDK_KEY_KP_Right: return 0xFF98;
+            case GDK_KEY_KP_Down: return 0xFF99;
+            case GDK_KEY_KP_Page_Up: return 0xFF9A;
+            case GDK_KEY_KP_Page_Down: return 0xFF9B;
+            case GDK_KEY_KP_End: return 0xFF9C;
+            case GDK_KEY_KP_Begin: return 0xFF9D;
+            case GDK_KEY_KP_Insert: return 0xFF9E;
+            case GDK_KEY_KP_Delete: return 0xFF9F;
+            case GDK_KEY_KP_Equal: return 0xFFBD;
+            case GDK_KEY_KP_Multiply: return 0xFFAA;
+            case GDK_KEY_KP_Add: return 0xFFAB;
+            case GDK_KEY_KP_Separator: return 0xFFAC;
+            case GDK_KEY_KP_Subtract: return 0xFFAD;
+            case GDK_KEY_KP_Decimal: return 0xFFAE;
+            case GDK_KEY_KP_Divide: return 0xFFAF;
+            case GDK_KEY_KP_0: return 0xFFB0;
+            case GDK_KEY_KP_1: return 0xFFB1;
+            case GDK_KEY_KP_2: return 0xFFB2;
+            case GDK_KEY_KP_3: return 0xFFB3;
+            case GDK_KEY_KP_4: return 0xFFB4;
+            case GDK_KEY_KP_5: return 0xFFB5;
+            case GDK_KEY_KP_6: return 0xFFB6;
+            case GDK_KEY_KP_7: return 0xFFB7;
+            case GDK_KEY_KP_8: return 0xFFB8;
+            case GDK_KEY_KP_9: return 0xFFB9;
+        }
+    }
+
+    switch (keyval) {
+        case GDK_KEY_BackSpace: return 0xFF08;
+        case GDK_KEY_Tab: return 0xFF09;
+        case GDK_KEY_Linefeed: return 0xFF0A;
+        case GDK_KEY_Clear: return 0xFF0B;
+        case GDK_KEY_Return: return 0xFF0D;
+        case GDK_KEY_Pause: return 0xFF13;
+        case GDK_KEY_Scroll_Lock: return 0xFF14;
+        case GDK_KEY_Sys_Req: return 0xFF15;
+        case GDK_KEY_Escape: return 0xFF1B;
+        case GDK_KEY_Delete: return 0xFFFF;
+        case GDK_KEY_Home: return 0xFF50;
+        case GDK_KEY_Left: return 0xFF51;
+        case GDK_KEY_Up: return 0xFF52;
+        case GDK_KEY_Right: return 0xFF53;
+        case GDK_KEY_Down: return 0xFF54;
+        case GDK_KEY_Page_Up: return 0xFF55;
+        case GDK_KEY_Page_Down: return 0xFF56;
+        case GDK_KEY_End: return 0xFF57;
+        case GDK_KEY_Begin: return 0xFF58;
+        case GDK_KEY_Select: return 0xFF60;
+        case GDK_KEY_Print: return 0xFF61;
+        case GDK_KEY_Execute: return 0xFF62;
+        case GDK_KEY_Insert: return 0xFF63;
+        case GDK_KEY_Undo: return 0xFF65;
+        case GDK_KEY_Redo: return 0xFF66;
+        case GDK_KEY_Menu: return 0xFF67;
+        case GDK_KEY_Find: return 0xFF68;
+        case GDK_KEY_Cancel: return 0xFF69;
+        case GDK_KEY_Help: return 0xFF6A;
+        case GDK_KEY_Break: return 0xFF6B;
+        case GDK_KEY_Mode_switch: return 0xFF7E;
+        case GDK_KEY_Num_Lock: return 0xFF7F;
+        case GDK_KEY_F1: return 0xFFBE;
+        case GDK_KEY_F2: return 0xFFBF;
+        case GDK_KEY_F3: return 0xFFC0;
+        case GDK_KEY_F4: return 0xFFC1;
+        case GDK_KEY_F5: return 0xFFC2;
+        case GDK_KEY_F6: return 0xFFC3;
+        case GDK_KEY_F7: return 0xFFC4;
+        case GDK_KEY_F8: return 0xFFC5;
+        case GDK_KEY_F9: return 0xFFC6;
+        case GDK_KEY_F10: return 0xFFC7;
+        case GDK_KEY_F11: return 0xFFC8;
+        case GDK_KEY_F12: return 0xFFC9;
+        case GDK_KEY_Shift_L: return 0xFFE1;
+        case GDK_KEY_Shift_R: return 0xFFE2;
+        case GDK_KEY_Control_L: return 0xFFE3;
+        case GDK_KEY_Control_R: return 0xFFE4;
+        case GDK_KEY_Caps_Lock: return 0xFFE5;
+        case GDK_KEY_Shift_Lock: return 0xFFE6;
+        case GDK_KEY_Meta_L: return 0xFFE7;
+        case GDK_KEY_Meta_R: return 0xFFE8;
+        case GDK_KEY_Alt_L: return 0xFFE9;
+        case GDK_KEY_Alt_R: return 0xFFEA;
+        case GDK_KEY_Super_L: return 0xFFEB;
+        case GDK_KEY_Super_R: return 0xFFEC;
+        case GDK_KEY_Hyper_L: return 0xFFED;
+        case GDK_KEY_Hyper_R: return 0xFFEE;
+    }
+
+    if (keyval >= 0x20 && keyval <= 0xFF) return keyval;
+
+    return 0;
+}
+
+static gboolean on_key_event(GtkWidget* widget, GdkEventKey* event, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    if (vnc_fd < 0) return TRUE;
+
+    guint keysym = map_gdk_keyval_to_keysym(event->keyval);
+    if (keysym > 0) {
+        uint8_t down = (event->type == GDK_KEY_PRESS) ? 1 : 0;
+        vnc_core_send_key(keysym, down);
+    }
+    return TRUE;
+}
+
+static gboolean apply_remote_desktop_size_idle(gpointer data) {
+    (void)data;
+    if (viewer_window && drawing_area) {
+        gtk_window_resize(GTK_WINDOW(viewer_window), screen_w, screen_h);
+        gtk_widget_set_size_request(drawing_area, screen_w, screen_h);
+        gtk_widget_queue_draw(drawing_area);
+        DEBUG_LOG("UI size updated to %dx%d to match server", screen_w, screen_h);
+    }
+    return FALSE;
+}
+
+static gboolean debounce_resize_timeout(gpointer data) {
+    (void)data;
+    resize_debounce_source = 0;
+    if (vnc_fd >= 0) {
+        DEBUG_LOG("Client-driven desktop resize: sending SetDesktopSize request to %dx%d...",
+                  pending_resize_w, pending_resize_h);
+        
+        uint8_t msg[8];
+        msg[0] = VNC_MSG_SET_DESKTOP_SIZE;
+        msg[1] = 0;
+        msg[2] = 0;
+        msg[3] = 1; // number of screens
+        write_u16_be(msg + 4, pending_resize_w);
+        write_u16_be(msg + 6, pending_resize_h);
+        send(vnc_fd, msg, 8, 0);
+
+        uint8_t scr_info[16];
+        write_u32_be(scr_info + 0, 0); // screen ID
+        write_u16_be(scr_info + 4, 0); // x-position
+        write_u16_be(scr_info + 6, 0); // y-position
+        write_u16_be(scr_info + 8, pending_resize_w);
+        write_u16_be(scr_info + 10, pending_resize_h);
+        write_u32_be(scr_info + 12, 0); // flags
+        send(vnc_fd, scr_info, 16, 0);
+    }
+    return FALSE;
+}
+
+static gboolean on_viewer_configure(GtkWidget* widget, GdkEventConfigure* event, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    if (vnc_fd < 0 || screen_w <= 0 || screen_h <= 0) return FALSE;
+
+    int new_w = event->width;
+    int new_h = event->height;
+
+    // Check if the user is dragging or resizing the window
+    if (new_w != screen_w || new_h != screen_h) {
+        if (resize_debounce_source != 0) {
+            g_source_remove(resize_debounce_source);
+        }
+        pending_resize_w = new_w;
+        pending_resize_h = new_h;
+        resize_debounce_source = g_timeout_add(VNC_RESIZE_DEBOUNCE_MS, debounce_resize_timeout, NULL);
+    }
+    return FALSE;
+}
+
+// Client Core Callbacks
+static void send_raw_cb(const uint8_t* data, size_t len, void* user_data) {
+    (void)user_data;
+    if (vnc_fd >= 0) {
+        send(vnc_fd, data, len, 0);
+    }
+}
+
+static void on_screen_update_cb(int x, int y, int w, int h, void* user_data) {
+    (void)x; (void)y; (void)w; (void)h; (void)user_data;
+    pthread_mutex_lock(&backbuffer_mutex);
+    waiting_for_draw = 1;
+    pthread_mutex_unlock(&backbuffer_mutex);
+    g_idle_add((GSourceFunc)queue_draw_idle, NULL);
+}
+
+static void on_desktop_resize_cb(int w, int h, void* user_data) {
+    (void)w; (void)h; (void)user_data;
+    g_idle_add(apply_remote_desktop_size_idle, NULL);
+}
+
+static void on_clipboard_update_cb(const char* text, int len, void* user_data) {
+    (void)user_data;
+    char* copy = malloc((size_t)len + 1);
+    if (copy) {
+        memcpy(copy, text, (size_t)len);
+        copy[len] = '\0';
+        g_idle_add(apply_server_clipboard_idle, copy);
+    }
+}
+
+static gboolean show_error_dialog_idle(gpointer data) {
+    char* msg = (char*)data;
+    show_error_dialog(GTK_WINDOW(main_window), msg);
+    free(msg);
+    return FALSE;
+}
+
+static void on_disconnect_cb(const char* reason, void* user_data) {
+    (void)user_data;
+    char* copy = strdup(reason);
+    g_idle_add(show_error_dialog_idle, copy);
+}
+
+static char* request_password_cb(void* user_data) {
+    (void)user_data;
+    return prompt_password();
+}
+
+static int on_custom_encoding_cb(int fd, uint32_t encoding, uint16_t rx, uint16_t ry, uint16_t rw, uint16_t rh, void* user_data) {
+    (void)rx; (void)ry; (void)user_data;
+    if (encoding == 50 || encoding == VNC_ENCODING_VP9) { // H.264 / VP9
+        active_video_codec_id = (encoding == VNC_ENCODING_VP9) ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
+        uint32_t length = 0;
+        uint32_t flags = 0;
+        if (read_exact(fd, &length, 4) < 0 || read_exact(fd, &flags, 4) < 0) return -1;
+        length = read_u32_be((uint8_t*)&length);
+        flags = read_u32_be((uint8_t*)&flags);
+
+        uint8_t* payload = malloc(length);
+        if (read_exact(fd, payload, length) < 0) {
+            free(payload);
+            return -1;
+        }
+
+        if (flags & 2) {
+            reset_decoder(rw, rh);
+        }
+
+        if (decoder_primed && length > 0) {
+            decode_video(payload, (int)length, backbuffer, rw, rh);
+        }
+        free(payload);
+
+        pthread_mutex_lock(&backbuffer_mutex);
+        waiting_for_draw = 1;
+        pthread_mutex_unlock(&backbuffer_mutex);
+        g_idle_add((GSourceFunc)queue_draw_idle, NULL);
+        return 0;
+    }
+    else if (encoding == VNC_ENCODING_UDP_SETUP) {
+        uint8_t setup_payload[VNC_UDP_SETUP_PAYLOAD_LEN];
+        if (read_exact(fd, setup_payload, sizeof(setup_payload)) < 0) return -1;
+        udp_handle_setup(setup_payload);
+        return 0;
+    }
+    return 0;
+}
+
 static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     (void)btn;
     GtkWindow* parent = GTK_WINDOW(user_data);
@@ -1403,10 +1212,8 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
         strncpy(host, addr_text, sizeof(host) - 1);
     }
 
-    // Save configuration
     save_last_address(host, port);
 
-    // Parse preferred encoding option
     int enc_active = gtk_combo_box_get_active(GTK_COMBO_BOX(combo_encoding));
     if (enc_active == 0) strcpy(preferred_encoding, "h264");
     else if (enc_active == 1) strcpy(preferred_encoding, "vp9");
@@ -1415,7 +1222,6 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     else strcpy(preferred_encoding, "raw");
     DEBUG_LOG("connecting to %s:%d with preferred encoding=%s", host, port, preferred_encoding);
 
-    // Perform socket connection
     struct hostent* he = gethostbyname(host);
     if (!he) {
         show_error_dialog(parent, "Could not resolve hostname.");
@@ -1427,9 +1233,8 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr = *(struct in_addr*)he->h_addr;
-    udp_server_in_addr = addr.sin_addr; // remembered for the UDP H.264 side-channel
+    udp_server_in_addr = addr.sin_addr;
 
-    // Timeout connecting in case of unreachable hosts (default 3 seconds)
     struct timeval tv;
     tv.tv_sec = 3;
     tv.tv_usec = 0;
@@ -1443,262 +1248,126 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     }
     DEBUG_LOG("TCP connect succeeded");
 
-    // Clear timeout setting for runtime VNC operations
     tv.tv_sec = 0;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 
-    // 1. Version Handshake
-    char ver[13] = {0};
-    if (read_exact(fd, ver, 12) < 0) {
-        close(fd);
-        show_error_dialog(parent, "Failed to read VNC protocol version.");
-        return;
-    }
-    DEBUG_LOG("server protocol version: %.12s", ver);
-    send(fd, "RFB 003.008\n", 12, 0);
-
-    // 2. Security Handshake
-    uint8_t num_sec_types = 0;
-    if (read_exact(fd, &num_sec_types, 1) < 0 || num_sec_types == 0) {
-        close(fd);
-        show_error_dialog(parent, "No valid security types returned from server.");
-        return;
-    }
-
-    uint8_t* sec_types = malloc(num_sec_types);
-    if (read_exact(fd, sec_types, num_sec_types) < 0) {
-        free(sec_types);
-        close(fd);
-        show_error_dialog(parent, "Failed to read VNC security options.");
-        return;
-    }
-
-    uint8_t selected_sec = 0;
-    for (int i = 0; i < num_sec_types; i++) {
-        if (sec_types[i] == 2) {
-            selected_sec = 2;
-            break;
-        } else if (sec_types[i] == 1 && selected_sec == 0) {
-            selected_sec = 1;
-        }
-    }
-    free(sec_types);
-
-    if (selected_sec == 0) {
-        close(fd);
-        show_error_dialog(parent, "No supported authentication method (requires None or VncAuth).");
-        return;
-    }
-
-    DEBUG_LOG("security type selected: %d (%s)", selected_sec, selected_sec == 2 ? "VncAuth" : "None");
-    send(fd, &selected_sec, 1, 0);
-
-    // 3. Authenticate
-    if (selected_sec == 2) { // VncAuth required
-        uint8_t challenge[16];
-        if (read_exact(fd, challenge, 16) < 0) {
-            close(fd);
-            show_error_dialog(parent, "Failed to read VncAuth challenge.");
-            return;
-        }
-
-        // Prompt user for password using the modal dialog
-        char* pwd = prompt_password(parent);
-        if (!pwd) {
-            close(fd);
-            return; // cancelled
-        }
-
-        uint8_t response[16];
-        vnc_encrypt_bytes(pwd, challenge, response);
-        g_free(pwd);
-
-        send(fd, response, 16, 0);
-    }
-
-    uint32_t sec_result = 0;
-    if (read_exact(fd, &sec_result, 4) < 0) {
-        close(fd);
-        show_error_dialog(parent, "Failed to read authentication result.");
-        return;
-    }
-    sec_result = read_u32_be((uint8_t*)&sec_result);
-
-    if (sec_result != 0) {
-        close(fd);
-        show_error_dialog(parent, "Authentication failed (Incorrect Password).");
-        return;
-    }
-    DEBUG_LOG("authentication succeeded");
-
-    // 4. ClientInit
-    uint8_t shared = 1;
-    send(fd, &shared, 1, 0);
-
-    // 5. ServerInit
-    uint16_t w = 0, h = 0;
-    uint8_t pix_fmt[16];
-    uint32_t name_len = 0;
-
-    if (read_exact(fd, &w, 2) < 0 || read_exact(fd, &h, 2) < 0 ||
-        read_exact(fd, pix_fmt, 16) < 0 || read_exact(fd, &name_len, 4) < 0) {
-        close(fd);
-        show_error_dialog(parent, "Failed to read ServerInit description.");
-        return;
-    }
-    w = read_u16_be((uint8_t*)&w);
-    h = read_u16_be((uint8_t*)&h);
-    name_len = read_u32_be((uint8_t*)&name_len);
-
-    char* server_name = malloc(name_len + 1);
-    if (read_exact(fd, server_name, name_len) < 0) {
-        free(server_name);
-        close(fd);
-        show_error_dialog(parent, "Failed to read VNC server desktop name.");
-        return;
-    }
-    server_name[name_len] = '\0';
-    DEBUG_LOG("ServerInit: %ux%u name=\"%s\"", w, h, server_name);
-    free(server_name);
-
     vnc_fd = fd;
-    screen_w = w;
-    screen_h = h;
 
-    // Allocate local framebuffer
-    pthread_mutex_lock(&backbuffer_mutex);
-    backbuffer = realloc(backbuffer, (size_t)w * h * 4);
-    memset(backbuffer, 0, (size_t)w * h * 4);
-    pthread_mutex_unlock(&backbuffer_mutex);
+    // Initialize VNC Core
+    vnc_core_callbacks_t cb;
+    cb.send_raw = send_raw_cb;
+    cb.on_screen_update = on_screen_update_cb;
+    cb.on_desktop_resize = on_desktop_resize_cb;
+    cb.on_clipboard_update = on_clipboard_update_cb;
+    cb.on_disconnect = on_disconnect_cb;
+    cb.request_password = request_password_cb;
+    cb.on_custom_encoding = on_custom_encoding_cb;
 
-    // Hide main entry connection window
+    vnc_core_init(&cb, NULL);
+
+    // Perform VNC handshake synchronously on main thread (necessary for password dialog)
+    if (vnc_core_desktop_handshake(vnc_fd, preferred_encoding) < 0) {
+        vnc_core_cleanup();
+        close(vnc_fd);
+        vnc_fd = -1;
+        show_error_dialog(parent, "VNC protocol handshake failed.");
+        return;
+    }
+
     gtk_widget_hide(main_window);
 
-    // Create live streaming window
+    // Create Viewer Window
     viewer_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    char title[256];
-    snprintf(title, sizeof(title), "%s:%d - vncviewer", host, port);
+    char title[384];
+    snprintf(title, sizeof(title), "VNC Viewer - %s:%d", host, port);
     gtk_window_set_title(GTK_WINDOW(viewer_window), title);
     gtk_window_set_default_size(GTK_WINDOW(viewer_window), screen_w, screen_h);
 
     drawing_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(drawing_area, screen_w, screen_h);
     gtk_container_add(GTK_CONTAINER(viewer_window), drawing_area);
 
-    gtk_widget_set_can_focus(drawing_area, TRUE);
-    gtk_widget_set_events(drawing_area, GDK_POINTER_MOTION_MASK | 
-                                        GDK_BUTTON_PRESS_MASK | 
-                                        GDK_BUTTON_RELEASE_MASK |
-                                        GDK_SCROLL_MASK |
-                                        GDK_KEY_PRESS_MASK |
-                                        GDK_KEY_RELEASE_MASK);
+    gtk_widget_add_events(drawing_area, GDK_POINTER_MOTION_MASK |
+                                         GDK_BUTTON_PRESS_MASK |
+                                         GDK_BUTTON_RELEASE_MASK |
+                                         GDK_SCROLL_MASK);
 
     g_signal_connect(G_OBJECT(drawing_area), "draw", G_CALLBACK(on_draw), NULL);
     g_signal_connect(G_OBJECT(drawing_area), "motion-notify-event", G_CALLBACK(on_motion), NULL);
     g_signal_connect(G_OBJECT(drawing_area), "button-press-event", G_CALLBACK(on_button), NULL);
     g_signal_connect(G_OBJECT(drawing_area), "button-release-event", G_CALLBACK(on_button), NULL);
     g_signal_connect(G_OBJECT(drawing_area), "scroll-event", G_CALLBACK(on_scroll), NULL);
-    g_signal_connect(G_OBJECT(drawing_area), "key-press-event", G_CALLBACK(on_key_event), NULL);
-    g_signal_connect(G_OBJECT(drawing_area), "key-release-event", G_CALLBACK(on_key_event), NULL);
-    g_signal_connect(G_OBJECT(drawing_area), "configure-event", G_CALLBACK(on_drawing_area_configure), NULL);
-
+    g_signal_connect(G_OBJECT(viewer_window), "key-press-event", G_CALLBACK(on_key_event), NULL);
+    g_signal_connect(G_OBJECT(viewer_window), "key-release-event", G_CALLBACK(on_key_event), NULL);
+    g_signal_connect(G_OBJECT(viewer_window), "configure-event", G_CALLBACK(on_viewer_configure), NULL);
     g_signal_connect(G_OBJECT(viewer_window), "destroy", G_CALLBACK(on_viewer_destroy), NULL);
 
     gtk_widget_show_all(viewer_window);
-    gtk_widget_grab_focus(drawing_area);
 
-    // Spawn background VNC receiver thread
-    pthread_t thread;
-    pthread_create(&thread, NULL, vnc_client_thread, NULL);
-    pthread_detach(thread);
+    // Setup GtkClipboard monitor
+    GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    g_signal_connect(clipboard, "owner-change", G_CALLBACK(on_clipboard_owner_change), NULL);
+
+    // Spawn VNC reader thread
+    pthread_t tid;
+    client_running = 1;
+    pthread_create(&tid, NULL, vnc_client_thread, NULL);
+    pthread_detach(tid);
 }
 
 int main(int argc, char* argv[]) {
     gtk_init(&argc, &argv);
 
-    GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-    g_signal_connect(G_OBJECT(clipboard), "owner-change", G_CALLBACK(on_clipboard_owner_change), NULL);
+    char host[256];
+    int port = 5900;
+    load_last_address(host, &port);
 
-    // Create main clean dialog window
     main_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(main_window), "VNC Connection Manager");
-    gtk_window_set_default_size(GTK_WINDOW(main_window), 380, 240);
-    gtk_window_set_resizable(GTK_WINDOW(main_window), FALSE);
-    gtk_window_set_position(GTK_WINDOW(main_window), GTK_WIN_POS_CENTER);
-    g_signal_connect(main_window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    gtk_window_set_title(GTK_WINDOW(main_window), "Connect to VNC Server");
+    gtk_container_set_border_width(GTK_CONTAINER(main_window), 20);
+    gtk_window_set_default_size(GTK_WINDOW(main_window), 450, 180);
 
-    // CSS Styling for visual aesthetics (Wow factor)
-    GtkCssProvider* provider = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(provider,
-        "window { background-color: #1e1e24; color: #f5f5f6; font-family: 'Inter', sans-serif; }\n"
-        "box { padding: 24px; }\n"
-        "entry { background-color: #2b2b36; color: white; border: 1px solid #4f46e5; border-radius: 6px; padding: 10px; font-size: 14px; margin-bottom: 12px; }\n"
-        "combobox { background-color: #2b2b36; border: 1px solid #4f46e5; border-radius: 6px; padding: 4px; font-size: 13px; margin-bottom: 16px; }\n"
-        "button { background-color: #4f46e5; color: white; border-radius: 6px; padding: 12px; font-weight: bold; font-size: 14px; }\n"
-        "button:hover { background-color: #4338ca; }\n"
-        "label.title { font-size: 20px; font-weight: bold; color: white; margin-bottom: 6px; }\n"
-        "label.subtitle { font-size: 12px; color: #9ca3af; margin-bottom: 20px; }\n"
-        "label.field { font-size: 12px; font-weight: bold; color: #d1d5db; margin-bottom: 6px; }\n", -1, NULL);
-    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
-        GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_container_add(GTK_CONTAINER(main_window), vbox);
 
-    // Title label
-    GtkWidget* lbl_title = gtk_label_new("leanrfb VNC Client");
-    gtk_style_context_add_class(gtk_widget_get_style_context(lbl_title), "title");
-    gtk_widget_set_halign(lbl_title, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(vbox), lbl_title, FALSE, FALSE, 0);
-
-    GtkWidget* lbl_sub = gtk_label_new("Enter your remote VNC address to connect");
-    gtk_style_context_add_class(gtk_widget_get_style_context(lbl_sub), "subtitle");
-    gtk_widget_set_halign(lbl_sub, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(vbox), lbl_sub, FALSE, FALSE, 0);
-
-    // Server address label & field
-    GtkWidget* lbl_addr = gtk_label_new("VNC Server Address:");
-    gtk_style_context_add_class(gtk_widget_get_style_context(lbl_addr), "field");
-    gtk_widget_set_halign(lbl_addr, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(vbox), lbl_addr, FALSE, FALSE, 0);
+    GtkWidget* label = gtk_label_new("VNC Server Address (host:port or host):");
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
 
     entry_address = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(entry_address), "127.0.0.1:5900");
+    char addr_str[384];
+    snprintf(addr_str, sizeof(addr_str), "%s:%d", host, port);
+    gtk_entry_set_text(GTK_ENTRY(entry_address), addr_str);
     gtk_box_pack_start(GTK_BOX(vbox), entry_address, FALSE, FALSE, 0);
 
-    // Pre-fill last used connection
-    char last_host[256];
-    int last_port;
-    load_last_address(last_host, &last_port);
-    char full_addr[300];
-    snprintf(full_addr, sizeof(full_addr), "%s:%d", last_host, last_port);
-    gtk_entry_set_text(GTK_ENTRY(entry_address), full_addr);
-
-    // Preferred encoding label & field
-    GtkWidget* lbl_enc = gtk_label_new("Preferred Encoding:");
-    gtk_style_context_add_class(gtk_widget_get_style_context(lbl_enc), "field");
-    gtk_widget_set_halign(lbl_enc, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(vbox), lbl_enc, FALSE, FALSE, 0);
+    // Encoding choice dropdown
+    GtkWidget* hbox_enc = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox_enc, FALSE, FALSE, 0);
+    
+    GtkWidget* label_enc = gtk_label_new("Preferred Encoding:");
+    gtk_box_pack_start(GTK_BOX(hbox_enc), label_enc, FALSE, FALSE, 0);
 
     combo_encoding = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "H.264 Video (Zero Latency)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "VP9 Video (Zero Latency)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Tight JPEG (Medium Bandwidth)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Hextile (Low CPU)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Raw (Local Connection)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "H.264 Video");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "VP9 Video");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Tight (JPEG)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Hextile");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Raw");
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo_encoding), 0);
-    gtk_box_pack_start(GTK_BOX(vbox), combo_encoding, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox_enc), combo_encoding, TRUE, TRUE, 0);
 
-    // Connect button
     GtkWidget* btn_connect = gtk_button_new_with_label("Connect");
-    g_signal_connect(btn_connect, "clicked", G_CALLBACK(on_btn_connect_clicked), main_window);
     gtk_box_pack_start(GTK_BOX(vbox), btn_connect, FALSE, FALSE, 0);
 
-    // Connect Entry Activate (pressing Enter key connects)
+    g_signal_connect(btn_connect, "clicked", G_CALLBACK(on_btn_connect_clicked), main_window);
     g_signal_connect(G_OBJECT(entry_address), "activate", G_CALLBACK(on_btn_connect_clicked), main_window);
+    g_signal_connect(main_window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
     gtk_widget_show_all(main_window);
     gtk_main();
+
+    vnc_core_cleanup();
+
     return 0;
 }

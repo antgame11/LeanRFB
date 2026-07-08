@@ -1,6 +1,5 @@
 #define _DEFAULT_SOURCE
 #include "leanrfb_internal.h"
-#include "vnc_lite_standalone.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,6 +105,98 @@ static void get_header_value(const char* header_start, char* dest, size_t dest_l
         i++;
     }
     dest[i] = '\0';
+}
+
+// Extracts the request-target from an HTTP request line ("GET <path> HTTP/1.1").
+// `request` must point at the start of the "GET " token.
+static void get_request_path(const char* request, char* path_out, size_t path_out_len) {
+    const char* start = request + 4; // skip "GET "
+    size_t i = 0;
+    while (start[i] && start[i] != ' ' && start[i] != '\r' && start[i] != '\n' && i < path_out_len - 1) {
+        path_out[i] = start[i];
+        i++;
+    }
+    path_out[i] = '\0';
+}
+
+static const char* content_type_for_file(const char* filename) {
+    size_t len = strlen(filename);
+    if (len >= 5 && strcmp(filename + len - 5, ".wasm") == 0) return "application/wasm";
+    if (len >= 3 && strcmp(filename + len - 3, ".js") == 0) return "application/javascript";
+    return "text/html";
+}
+
+// Maps an HTTP request path to the on-disk file (relative to the server's
+// working directory) produced by `make wasm`. Returns NULL for unknown paths.
+static const char* resolve_web_client_path(const char* req_path) {
+    if (strcmp(req_path, "/") == 0 || strcmp(req_path, "/index.html") == 0) {
+        return "vncview_web.html";
+    }
+    if (strcmp(req_path, "/vncview_web.js") == 0) return "vncview_web.js";
+    if (strcmp(req_path, "/vncview_web.wasm") == 0) return "vncview_web.wasm";
+    return NULL;
+}
+
+// Serves the WASM vncview web client (vncview_web.html/.js/.wasm, built via
+// `make wasm`) as static files from the server's working directory. This is
+// what a browser gets when it opens the VNC server's TCP port directly with a
+// plain (non-WebSocket) HTTP GET.
+static void serve_web_client(vnc_client_t* client, const char* req_path) {
+    const char* filename = resolve_web_client_path(req_path);
+    if (!filename) {
+        const char* body = "404 Not Found\r\n";
+        char hdr[128];
+        int hdr_len = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+            strlen(body));
+        send(client->fd, hdr, hdr_len, MSG_NOSIGNAL);
+        send(client->fd, body, strlen(body), MSG_NOSIGNAL);
+        return;
+    }
+
+    FILE* f = fopen(filename, "rb");
+    if (!f) {
+        const char* body =
+            "VNC web client not built.\r\n"
+            "Run `make wasm` (requires the Emscripten SDK) from the project root,\r\n"
+            "then restart this server from the same directory.\r\n";
+        char hdr[256];
+        int hdr_len = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+            strlen(body));
+        send(client->fd, hdr, hdr_len, MSG_NOSIGNAL);
+        send(client->fd, body, strlen(body), MSG_NOSIGNAL);
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize < 0) {
+        fclose(f);
+        return;
+    }
+
+    char hdr[256];
+    int hdr_len = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n",
+        content_type_for_file(filename), fsize);
+    send(client->fd, hdr, hdr_len, MSG_NOSIGNAL);
+
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        size_t sent_total = 0;
+        while (sent_total < n) {
+            ssize_t sent = send(client->fd, buf + sent_total, n - sent_total, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                fclose(f);
+                return;
+            }
+            sent_total += (size_t)sent;
+        }
+    }
+    fclose(f);
 }
 
 static int parse_websocket_frames(vnc_server_t* server, vnc_client_t* client) {
@@ -980,23 +1071,9 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                     } else {
                         set_blocking(client->fd);
 
-                        char resp_hdr[256];
-                        int hdr_len = snprintf(resp_hdr, sizeof(resp_hdr),
-                            "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: text/html\r\n"
-                            "Content-Length: %u\r\n"
-                            "Connection: close\r\n"
-                            "\r\n", vnc_lite_standalone_html_len);
-
-                        send(client->fd, resp_hdr, hdr_len, MSG_NOSIGNAL);
-
-                        size_t total_sent = 0;
-                        while (total_sent < vnc_lite_standalone_html_len) {
-                            ssize_t sent = send(client->fd, vnc_lite_standalone_html + total_sent, 
-                                                vnc_lite_standalone_html_len - total_sent, MSG_NOSIGNAL);
-                            if (sent <= 0) break;
-                            total_sent += sent;
-                        }
+                        char req_path[256];
+                        get_request_path((char*)p, req_path, sizeof(req_path));
+                        serve_web_client(client, req_path);
 
                         goto disconnect;
                     }

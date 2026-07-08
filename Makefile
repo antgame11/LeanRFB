@@ -37,13 +37,22 @@ x11_vnc_server: x11_vnc/x11_vnc_server.o $(LIB_NAME)
 x11_vnc/x11_vnc_server.o: x11_vnc/x11_vnc_server.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-vncviewer: vncview/vncview.o
-	$(CC) -o $@ vncview/vncview.o $(CLIENT_LDFLAGS)
+vncviewer: vncview/vncview.o vncview/vnc_client_core.o
+	$(CC) -o $@ vncview/vncview.o vncview/vnc_client_core.o $(CLIENT_LDFLAGS)
 
 vncview/vncview.o: vncview/vncview.c
 	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -c -o $@ $<
 
-clean:
-	rm -f src/*.o examples/*.o x11_vnc/*.o vncview/*.o $(LIB_NAME) demo_server x11_vnc_server vncviewer x11_vnc_server.conf
+vncview/vnc_client_core.o: vncview/vnc_client_core.c
+	$(CC) $(CFLAGS) $(CLIENT_CFLAGS) -c -o $@ $<
 
-.PHONY: all clean
+clean:
+	rm -f src/*.o examples/*.o x11_vnc/*.o vncview/*.o $(LIB_NAME) demo_server x11_vnc_server vncviewer x11_vnc_server.conf vncview_web.js vncview_web.wasm vncview_web.html
+
+wasm: vncview/vncview_web.c vncview/vnc_client_core.c
+	emcc -O3 -Wall -Wextra -std=gnu99 vncview/vncview_web.c vncview/vnc_client_core.c -o vncview_web.js \
+		-sUSE_SDL=2 -sUSE_LIBJPEG=1 -sALLOW_MEMORY_GROWTH=1 -sEXPORTED_RUNTIME_METHODS=ccall,cwrap \
+		-lwebsocket.js
+	cp -f vncview/vncview_web.html .
+
+.PHONY: all clean wasm
