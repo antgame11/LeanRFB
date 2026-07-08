@@ -142,11 +142,19 @@ void* vnc_vp9_encoder_create(int width, int height, int fps, int quality) {
                 av_buffer_unref(&hw_frames_ref);
             }
 
-            if (enc->codec_ctx->hw_frames_ctx && avcodec_open2(enc->codec_ctx, codec, NULL) >= 0) {
-                enc->is_hw = 1; // VA-API
-                enc->hw_frame = av_frame_alloc();
-                printf("[VNC SERVER] GPU VA-API Hardware Encoding enabled successfully (VP9).\n");
-                goto init_frames;
+            if (!enc->codec_ctx->hw_frames_ctx) {
+                fprintf(stderr, "[VNC SERVER] VP9: VAAPI hw_frames_ctx init failed, trying libvpx-vp9 next\n");
+            } else {
+                int open_ret = avcodec_open2(enc->codec_ctx, codec, NULL);
+                if (open_ret >= 0) {
+                    enc->is_hw = 1; // VA-API
+                    enc->hw_frame = av_frame_alloc();
+                    printf("[VNC SERVER] GPU VA-API Hardware Encoding enabled successfully (VP9).\n");
+                    goto init_frames;
+                }
+                char errbuf[128];
+                av_strerror(open_ret, errbuf, sizeof(errbuf));
+                fprintf(stderr, "[VNC SERVER] VP9: VAAPI avcodec_open2 failed, trying libvpx-vp9 next: %s\n", errbuf);
             }
             if (enc->codec_ctx->hw_frames_ctx) av_buffer_unref(&enc->codec_ctx->hw_frames_ctx);
             avcodec_free_context(&enc->codec_ctx);
@@ -186,15 +194,24 @@ void* vnc_vp9_encoder_create(int width, int height, int fps, int quality) {
         av_opt_set_int(enc->codec_ctx->priv_data, "lag-in-frames", 0, 0); // no lookahead buffering
         av_opt_set(enc->codec_ctx->priv_data, "tune-content", "screen", 0); // this is a desktop/UI stream, not camera video
 
-        if (avcodec_open2(enc->codec_ctx, codec, NULL) >= 0) {
+        int open_ret = avcodec_open2(enc->codec_ctx, codec, NULL);
+        if (open_ret >= 0) {
             enc->is_hw = 0; // Software libvpx-vp9
             printf("[VNC SERVER] GPU Hardware Encoding not supported. Falling back to CPU software encoding (VP9).\n");
             goto init_frames;
         }
+        {
+            char errbuf[128];
+            av_strerror(open_ret, errbuf, sizeof(errbuf));
+            fprintf(stderr, "[VNC SERVER] VP9: libvpx-vp9 avcodec_open2 failed: %s\n", errbuf);
+        }
         avcodec_free_context(&enc->codec_ctx);
     }
 
-    // Encoder setup failed completely
+    // Encoder setup failed completely — no VAAPI or libvpx-vp9 encoder could be
+    // opened. This client will never receive any VP9 video (silent black screen
+    // otherwise, since vnc_send_video_update() just returns when *enc_slot is NULL).
+    fprintf(stderr, "[VNC SERVER] VP9: no usable encoder found (VAAPI/libvpx-vp9 both failed or unavailable)\n");
     av_packet_free(&enc->pkt);
     free(enc);
     return NULL;
