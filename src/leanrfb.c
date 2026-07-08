@@ -1535,6 +1535,18 @@ static const vnc_video_ops_t vnc_vp9_ops = {
 // whichever of client->h264_enc / client->vp9_enc corresponds to `ops`.
 static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
                                   void** enc_slot, const vnc_video_ops_t* ops) {
+    int udp_active = client->supports_udp && client->udp_ready && server->udp_fd >= 0 &&
+                     (get_time_ms() - client->udp_last_recv_ms < VNC_UDP_LIVENESS_TIMEOUT_MS);
+    if (udp_active) {
+        if (!client->was_udp_active) {
+            client->force_keyframe_requested = 1;
+            client->was_udp_active = 1;
+            memset(client->dirty_tiles, 1, (size_t)server->cols * server->rows);
+        }
+    } else {
+        client->was_udp_active = 0;
+    }
+
     int has_dirty = 0;
     for (int i = 0; i < server->cols * server->rows; i++) {
         if (client->dirty_tiles[i]) {
@@ -1606,16 +1618,7 @@ static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
         }
     }
 
-    int udp_active = client->supports_udp && client->udp_ready && server->udp_fd >= 0 &&
-                     (get_time_ms() - client->udp_last_recv_ms < VNC_UDP_LIVENESS_TIMEOUT_MS);
-    if (udp_active) {
-        if (!client->was_udp_active) {
-            client->force_keyframe_requested = 1;
-            client->was_udp_active = 1;
-        }
-    } else {
-        client->was_udp_active = 0;
-    }
+
 
     if (client->force_keyframe_requested) {
         ops->force_keyframe(*enc_slot);
