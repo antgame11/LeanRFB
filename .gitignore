@@ -14,3 +14,9 @@ vncviewer
 # Configs
 x11_vnc_server.conf
 vncviewer
+
+# wasm build output (produced by `make wasm`; vncview/vncview_web.html is the
+# tracked source, this is the copy `make wasm` drops at the repo root)
+/vncview_web.html
+/vncview_web.js
+/vncview_web.wasm
