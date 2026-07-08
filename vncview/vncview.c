@@ -61,7 +61,10 @@ static inline uint32_t read_u32_be(const uint8_t *buf) {
 #define VNC_UDP_MAX_FRAGS 512
 #define VNC_UDP_MAX_DATAGRAM (VNC_UDP_HDR_LEN + VNC_UDP_TAG_LEN + VNC_UDP_INNER_HDR_LEN + VNC_UDP_MAX_FRAG_PAYLOAD)
 #define VNC_UDP_HEARTBEAT_INTERVAL_MS 2000
-#define VNC_UDP_REASM_TIMEOUT_MS 400
+// A lost fragment stalls video until this fires (abandon + request a fresh
+// keyframe) — was 400ms, which reads as very laggy on any real packet loss.
+// Comfortably above LAN jitter but far quicker to recover than before.
+#define VNC_UDP_REASM_TIMEOUT_MS 120
 #define VNC_UDP_CODEC_H264 0
 #define VNC_UDP_CODEC_VP9 1
 #define VNC_UDP_SETUP_PAYLOAD_LEN (2 + VNC_UDP_CID_LEN + VNC_UDP_KEY_LEN + 1)

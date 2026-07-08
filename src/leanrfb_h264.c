@@ -105,6 +105,11 @@ void* vnc_h264_encoder_create(int width, int height, int fps, int quality) {
         enc->codec_ctx->pix_fmt = AV_PIX_FMT_NV12;
         enc->codec_ctx->gop_size = fps * 2;
         enc->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        // B-frames require the decoder to buffer frames out of display order —
+        // pure latency with no benefit for a live desktop stream. LOW_DELAY above
+        // is only a hint some encoders honor; this is the field that actually
+        // guarantees it across NVENC/VAAPI/libx264.
+        enc->codec_ctx->max_b_frames = 0;
         
         av_opt_set(enc->codec_ctx->priv_data, "preset", "p1", 0); // Fastest low latency preset
         av_opt_set(enc->codec_ctx->priv_data, "tune", "ull", 0);   // Ultra low latency
@@ -130,6 +135,11 @@ void* vnc_h264_encoder_create(int width, int height, int fps, int quality) {
             enc->codec_ctx->pix_fmt = AV_PIX_FMT_VAAPI;
             enc->codec_ctx->gop_size = fps * 2;
             enc->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        // B-frames require the decoder to buffer frames out of display order —
+        // pure latency with no benefit for a live desktop stream. LOW_DELAY above
+        // is only a hint some encoders honor; this is the field that actually
+        // guarantees it across NVENC/VAAPI/libx264.
+        enc->codec_ctx->max_b_frames = 0;
 
             // Create VA-API frames context
             AVBufferRef* hw_frames_ref = av_hwframe_ctx_alloc(enc->hw_device_ctx);
@@ -170,6 +180,11 @@ void* vnc_h264_encoder_create(int width, int height, int fps, int quality) {
         enc->codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
         enc->codec_ctx->gop_size = fps * 2;
         enc->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        // B-frames require the decoder to buffer frames out of display order —
+        // pure latency with no benefit for a live desktop stream. LOW_DELAY above
+        // is only a hint some encoders honor; this is the field that actually
+        // guarantees it across NVENC/VAAPI/libx264.
+        enc->codec_ctx->max_b_frames = 0;
         
         enc->codec_ctx->thread_count = 0;
         enc->codec_ctx->thread_type = FF_THREAD_SLICE;
