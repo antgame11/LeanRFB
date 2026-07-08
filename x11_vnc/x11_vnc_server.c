@@ -362,6 +362,7 @@ int main(int argc, char* argv[]) {
     int udp_enabled = 1;
     int resize_w = 0, resize_h = 0; // 0,0 = don't resize; use the display's current resolution
     int allow_resize_enabled = 0;   // let clients live-resize the desktop (default off)
+    int audio_enabled = 0;          // stream desktop audio to clients that ask for it (default off)
     const char* password = NULL;
     const char* listen_host = "0.0.0.0";
     const char* display_name = "leanrfb X11 Server";
@@ -433,6 +434,12 @@ int main(int argc, char* argv[]) {
                 } else {
                     allow_resize_enabled = 0;
                 }
+            } else if (strcmp(key, "enable_audio") == 0) {
+                if (strcmp(value, "y") == 0 || strcmp(value, "yes") == 0 || strcmp(value, "1") == 0 || strcmp(value, "true") == 0) {
+                    audio_enabled = 1;
+                } else {
+                    audio_enabled = 0;
+                }
             }
         }
         fclose(cf);
@@ -496,6 +503,7 @@ int main(int argc, char* argv[]) {
     }
     printf("Encrypted UDP transport for H.264 video: %s\n", udp_enabled ? "enabled" : "disabled (TCP only)");
     printf("Client-driven live desktop resize: %s\n", allow_resize_enabled ? "enabled" : "disabled");
+    printf("Desktop audio streaming (QEMU VNC audio extension): %s\n", audio_enabled ? "enabled" : "disabled");
 
     // Create VNC server
     vnc_server_config_t config;
@@ -510,6 +518,7 @@ int main(int argc, char* argv[]) {
     config.websocket = websocket_enabled;
     config.disable_udp_h264 = !udp_enabled;
     config.allow_desktop_resize = allow_resize_enabled;
+    config.enable_audio = audio_enabled;
     config.on_key = on_key;
     config.on_pointer = on_pointer;
     config.on_resize_request = on_resize_request;

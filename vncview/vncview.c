@@ -17,6 +17,8 @@
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
+#include <pulse/simple.h>
+#include <pulse/error.h>
 #include <time.h>
 
 #include "vnc_client_core.h"
@@ -193,6 +195,15 @@ static GtkWidget* viewer_window = NULL;
 static GtkWidget* drawing_area = NULL;
 static GtkWidget* entry_address = NULL;
 static GtkWidget* combo_encoding = NULL;
+static GtkWidget* check_audio = NULL;
+
+// QEMU audio extension playback (see docs/custom/rfb_qemu_audio_extension.md).
+// Only ever touched from vnc_client_thread (the background socket reader), since
+// that's the thread on_audio_begin/on_audio_data/on_audio_end fire on — no locking
+// needed between them. The GTK main thread only reads want_audio (set once, before
+// the handshake) and never touches audio_playback itself.
+static int want_audio = 0;
+static pa_simple* audio_playback = NULL;
 
 // TCP socket descriptor
 int vnc_fd = -1;
@@ -742,6 +753,10 @@ static void on_viewer_destroy(void) {
         av_buffer_unref(&hw_device_ctx);
         hw_device_ctx = NULL;
     }
+    if (audio_playback) {
+        pa_simple_free(audio_playback);
+        audio_playback = NULL;
+    }
     if (sws_ctx) {
         sws_freeContext(sws_ctx);
         sws_ctx = NULL;
@@ -1150,6 +1165,51 @@ static char* request_password_cb(void* user_data) {
     return prompt_password();
 }
 
+// QEMU audio extension callbacks (see docs/custom/rfb_qemu_audio_extension.md).
+// All four fire on vnc_client_thread (the background socket reader), never the GTK
+// main thread, so audio_playback needs no locking between them.
+static void on_audio_supported_cb(void* user_data) {
+    (void)user_data;
+    if (!want_audio) return;
+    vnc_core_send_audio_set_format(VNC_AUDIO_FMT_S16, 2, 44100);
+    vnc_core_send_audio_enable();
+}
+
+static void on_audio_begin_cb(void* user_data) {
+    (void)user_data;
+    if (audio_playback) return;
+
+    pa_sample_spec spec;
+    spec.format = PA_SAMPLE_S16LE;
+    spec.channels = 2;
+    spec.rate = 44100;
+
+    int pa_err = 0;
+    audio_playback = pa_simple_new(NULL, "vncviewer", PA_STREAM_PLAYBACK, NULL,
+                                   "VNC server audio", &spec, NULL, NULL, &pa_err);
+    if (!audio_playback) {
+        fprintf(stderr, "Error: could not open audio playback: %s\n", pa_strerror(pa_err));
+    }
+}
+
+static void on_audio_data_cb(const uint8_t* pcm, size_t len, void* user_data) {
+    (void)user_data;
+    if (!audio_playback || len == 0) return;
+
+    int pa_err = 0;
+    if (pa_simple_write(audio_playback, pcm, len, &pa_err) < 0) {
+        DEBUG_LOG("audio playback write failed: %s", pa_strerror(pa_err));
+    }
+}
+
+static void on_audio_end_cb(void* user_data) {
+    (void)user_data;
+    if (audio_playback) {
+        pa_simple_free(audio_playback);
+        audio_playback = NULL;
+    }
+}
+
 static int on_custom_encoding_cb(int fd, uint32_t encoding, uint16_t rx, uint16_t ry, uint16_t rw, uint16_t rh, void* user_data) {
     (void)rx; (void)ry; (void)user_data;
     if (encoding == 50 || encoding == VNC_ENCODING_VP9) { // H.264 / VP9
@@ -1263,9 +1323,15 @@ static void on_btn_connect_clicked(GtkButton* btn, gpointer user_data) {
     cb.on_clipboard_update = on_clipboard_update_cb;
     cb.on_disconnect = on_disconnect_cb;
     cb.request_password = request_password_cb;
+    cb.on_audio_supported = on_audio_supported_cb;
+    cb.on_audio_begin = on_audio_begin_cb;
+    cb.on_audio_data = on_audio_data_cb;
+    cb.on_audio_end = on_audio_end_cb;
     cb.on_custom_encoding = on_custom_encoding_cb;
 
     vnc_core_init(&cb, NULL);
+    want_audio = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(check_audio));
+    vnc_core_request_audio(want_audio);
 
     // Perform VNC handshake synchronously on main thread (necessary for password dialog)
     if (vnc_core_desktop_handshake(vnc_fd, preferred_encoding) < 0) {
@@ -1356,6 +1422,11 @@ int main(int argc, char* argv[]) {
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_encoding), "Raw");
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo_encoding), 0);
     gtk_box_pack_start(GTK_BOX(hbox_enc), combo_encoding, TRUE, TRUE, 0);
+
+    // QEMU audio extension opt-in (see docs/custom/rfb_qemu_audio_extension.md).
+    // Only takes effect if the server also has it enabled — otherwise this is a no-op.
+    check_audio = gtk_check_button_new_with_label("Enable audio (if server supports it)");
+    gtk_box_pack_start(GTK_BOX(vbox), check_audio, FALSE, FALSE, 0);
 
     GtkWidget* btn_connect = gtk_button_new_with_label("Connect");
     gtk_box_pack_start(GTK_BOX(vbox), btn_connect, FALSE, FALSE, 0);

@@ -14,6 +14,13 @@ static SDL_Window* window = NULL;
 static SDL_Renderer* renderer = NULL;
 static SDL_Texture* texture = NULL;
 
+// QEMU audio extension (see docs/custom/rfb_qemu_audio_extension.md). SDL2's
+// WebSocket/network-message callbacks and its main loop both run on the single
+// browser JS thread this WASM module executes on, so there's no cross-thread
+// concern here the way there is on desktop.
+static int want_audio = 0;
+static SDL_AudioDeviceID audio_dev = 0;
+
 /* WebSocket Send Wrapper */
 static void send_raw_cb(const uint8_t* data, size_t len, void* user_data) {
     (void)user_data;
@@ -28,7 +35,7 @@ static void on_screen_update_cb(int x, int y, int w, int h, void* user_data) {
 static void on_desktop_resize_cb(int w, int h, void* user_data) {
     (void)user_data;
     if (!window) {
-        SDL_Init(SDL_INIT_VIDEO);
+        SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
         window = SDL_CreateWindow("WASM VNC Client", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, w, h, 0);
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     } else {
@@ -74,6 +81,47 @@ static char* request_password_cb(void* user_data) {
         stringToUTF8(p, str, len);
         return str;
     });
+}
+
+// QEMU audio extension callbacks (see docs/custom/rfb_qemu_audio_extension.md).
+static void on_audio_supported_cb(void* user_data) {
+    (void)user_data;
+    if (!want_audio) return;
+    vnc_core_send_audio_set_format(VNC_AUDIO_FMT_S16, 2, 44100);
+    vnc_core_send_audio_enable();
+}
+
+static void on_audio_begin_cb(void* user_data) {
+    (void)user_data;
+    if (audio_dev) return;
+
+    SDL_AudioSpec desired;
+    SDL_zero(desired);
+    desired.freq = 44100;
+    desired.format = AUDIO_S16LSB;
+    desired.channels = 2;
+    desired.samples = 2048;
+
+    audio_dev = SDL_OpenAudioDevice(NULL, 0, &desired, NULL, 0);
+    if (!audio_dev) {
+        printf("Error: could not open audio playback device: %s\n", SDL_GetError());
+        return;
+    }
+    SDL_PauseAudioDevice(audio_dev, 0);
+}
+
+static void on_audio_data_cb(const uint8_t* pcm, size_t len, void* user_data) {
+    (void)user_data;
+    if (!audio_dev || len == 0) return;
+    SDL_QueueAudio(audio_dev, pcm, (Uint32)len);
+}
+
+static void on_audio_end_cb(void* user_data) {
+    (void)user_data;
+    if (audio_dev) {
+        SDL_CloseAudioDevice(audio_dev);
+        audio_dev = 0;
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -131,6 +179,10 @@ static EM_BOOL onerror(int eventType, const EmscriptenWebSocketErrorEvent *webso
 static EM_BOOL onclose(int eventType, const EmscriptenWebSocketCloseEvent *websocketEvent, void *userData) {
     (void)eventType; (void)websocketEvent; (void)userData;
     printf("WebSocket connection closed!\n");
+    if (audio_dev) {
+        SDL_CloseAudioDevice(audio_dev);
+        audio_dev = 0;
+    }
     vnc_core_cleanup();
     return EM_TRUE;
 }
@@ -145,11 +197,11 @@ static EM_BOOL onmessage(int eventType, const EmscriptenWebSocketMessageEvent *w
 }
 
 EMSCRIPTEN_KEEPALIVE
-void connect_vnc(const char* url) {
+void connect_vnc(const char* url, int audio_requested) {
     EmscriptenWebSocketCreateAttributes attr;
     emscripten_websocket_init_create_attributes(&attr);
     attr.url = url;
-    
+
     ws = emscripten_websocket_new(&attr);
     emscripten_websocket_set_onopen_callback(ws, NULL, onopen);
     emscripten_websocket_set_onerror_callback(ws, NULL, onerror);
@@ -163,8 +215,14 @@ void connect_vnc(const char* url) {
     cb.on_clipboard_update = on_clipboard_update_cb;
     cb.on_disconnect = on_disconnect_cb;
     cb.request_password = request_password_cb;
+    cb.on_audio_supported = on_audio_supported_cb;
+    cb.on_audio_begin = on_audio_begin_cb;
+    cb.on_audio_data = on_audio_data_cb;
+    cb.on_audio_end = on_audio_end_cb;
 
     vnc_core_init(&cb, NULL);
+    want_audio = audio_requested;
+    vnc_core_request_audio(want_audio);
 }
 
 /* SDL Main Loop */

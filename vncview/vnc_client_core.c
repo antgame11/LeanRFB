@@ -17,9 +17,11 @@ int screen_h = 0;
 uint8_t* backbuffer = NULL;
 pthread_mutex_t backbuffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 int client_running = 0;
+int vnc_audio_available = 0;
 
 static vnc_core_callbacks_t core_callbacks;
 static void* core_user_data = NULL;
+static int audio_requested = 0;
 
 static uint8_t* input_buf = NULL;
 static size_t input_buf_len = 0;
@@ -290,6 +292,11 @@ void vnc_core_init(const vnc_core_callbacks_t* callbacks, void* user_data) {
     core_user_data = user_data;
     vnc_state = STATE_WAIT_VERSION;
     input_buf_len = 0;
+    vnc_audio_available = 0;
+}
+
+void vnc_core_request_audio(int enabled) {
+    audio_requested = enabled;
 }
 
 void vnc_core_cleanup(void) {
@@ -346,6 +353,35 @@ void vnc_core_send_fb_request(uint8_t incremental, uint16_t x, uint16_t y, uint1
     write_u16_be(buf + 4, y);
     write_u16_be(buf + 6, w);
     write_u16_be(buf + 8, h);
+    core_callbacks.send_raw(buf, 10, core_user_data);
+}
+
+// QEMU audio extension (VNC_MSG_CLIENT_QEMU=255 / VNC_MSG_CLIENT_QEMU_AUDIO=1
+// wrapper, matching QEMU's ui/vnc.c wire format exactly).
+void vnc_core_send_audio_enable(void) {
+    uint8_t buf[4];
+    buf[0] = 255;
+    buf[1] = 1;
+    write_u16_be(buf + 2, 0); // VNC_MSG_CLIENT_QEMU_AUDIO_ENABLE
+    core_callbacks.send_raw(buf, 4, core_user_data);
+}
+
+void vnc_core_send_audio_disable(void) {
+    uint8_t buf[4];
+    buf[0] = 255;
+    buf[1] = 1;
+    write_u16_be(buf + 2, 1); // VNC_MSG_CLIENT_QEMU_AUDIO_DISABLE
+    core_callbacks.send_raw(buf, 4, core_user_data);
+}
+
+void vnc_core_send_audio_set_format(uint8_t fmt, uint8_t channels, uint32_t freq) {
+    uint8_t buf[10];
+    buf[0] = 255;
+    buf[1] = 1;
+    write_u16_be(buf + 2, 2); // VNC_MSG_CLIENT_QEMU_AUDIO_SET_FORMAT
+    buf[4] = fmt;
+    buf[5] = channels;
+    write_u32_be(buf + 6, freq);
     core_callbacks.send_raw(buf, 10, core_user_data);
 }
 
@@ -464,14 +500,18 @@ void vnc_core_process_data(const uint8_t* data, size_t len) {
             core_callbacks.on_desktop_resize(w, h, core_user_data);
             
             // Send SetEncodings
-            uint8_t encs_msg[16];
+            uint8_t encs_msg[20];
             encs_msg[0] = 2; // SetEncodings
             encs_msg[1] = 0;
-            write_u16_be(encs_msg + 2, 3);
-            write_u32_be(encs_msg + 4, 7); // Tight (JPEG)
-            write_u32_be(encs_msg + 8, 0); // Raw
-            write_u32_be(encs_msg + 12, (uint32_t)VNC_ENCODING_EXT_DESKTOP_SIZE);
-            core_callbacks.send_raw(encs_msg, 16, core_user_data);
+            int n_encs = 0;
+            write_u32_be(encs_msg + 4 + (n_encs++) * 4, 7); // Tight (JPEG)
+            write_u32_be(encs_msg + 4 + (n_encs++) * 4, 0); // Raw
+            write_u32_be(encs_msg + 4 + (n_encs++) * 4, (uint32_t)VNC_ENCODING_EXT_DESKTOP_SIZE);
+            if (audio_requested) {
+                write_u32_be(encs_msg + 4 + (n_encs++) * 4, (uint32_t)VNC_ENCODING_AUDIO);
+            }
+            write_u16_be(encs_msg + 2, (uint16_t)n_encs);
+            core_callbacks.send_raw(encs_msg, 4 + (size_t)n_encs * 4, core_user_data);
 
             // Send initial FramebufferUpdateRequest
             vnc_core_send_fb_request(0, 0, 0, w, h);
@@ -564,14 +604,23 @@ void vnc_core_process_data(const uint8_t* data, size_t len) {
                         offset += 12 + body_len;
                         rects_parsed++;
                     }
+                    else if (encoding == VNC_ENCODING_AUDIO) {
+                        // QEMU audio feature ack: a bare pseudo-rect, no body.
+                        vnc_audio_available = 1;
+                        if (core_callbacks.on_audio_supported) {
+                            core_callbacks.on_audio_supported(core_user_data);
+                        }
+                        offset += 12;
+                        rects_parsed++;
+                    }
                     else {
                         offset += 12;
                         rects_parsed++;
                     }
                 }
-                
+
                 if (rects_parsed < num_rects) break;
-                
+
                 vnc_core_send_fb_request(1, 0, 0, screen_w, screen_h);
                 processed = offset;
             }
@@ -579,7 +628,7 @@ void vnc_core_process_data(const uint8_t* data, size_t len) {
                 if (input_buf_len < 8) break;
                 uint32_t length = read_u32_be(input_buf + 4);
                 if (input_buf_len < 8 + (size_t)length) break;
-                
+
                 char* text = malloc(length + 1);
                 if (text) {
                     memcpy(text, input_buf + 8, length);
@@ -587,8 +636,35 @@ void vnc_core_process_data(const uint8_t* data, size_t len) {
                     core_callbacks.on_clipboard_update(text, (int)length, core_user_data);
                     free(text);
                 }
-                
+
                 processed = 8 + (size_t)length;
+            }
+            else if (msg_type == 255) { // VNC_MSG_SERVER_QEMU
+                if (input_buf_len < 2) break;
+                uint8_t qemu_sub = input_buf[1];
+                if (qemu_sub == 1) { // VNC_MSG_SERVER_QEMU_AUDIO
+                    if (input_buf_len < 4) break;
+                    uint16_t audio_op = read_u16_be(input_buf + 2);
+                    if (audio_op == 0) { // END
+                        if (core_callbacks.on_audio_end) core_callbacks.on_audio_end(core_user_data);
+                        processed = 4;
+                    } else if (audio_op == 1) { // BEGIN
+                        if (core_callbacks.on_audio_begin) core_callbacks.on_audio_begin(core_user_data);
+                        processed = 4;
+                    } else if (audio_op == 2) { // DATA
+                        if (input_buf_len < 8) break;
+                        uint32_t len = read_u32_be(input_buf + 4);
+                        if (input_buf_len < 8 + (size_t)len) break;
+                        if (core_callbacks.on_audio_data) {
+                            core_callbacks.on_audio_data(input_buf + 8, len, core_user_data);
+                        }
+                        processed = 8 + (size_t)len;
+                    } else {
+                        processed = 4;
+                    }
+                } else {
+                    processed = 2;
+                }
             }
             else {
                 processed = 1;
@@ -798,6 +874,9 @@ int vnc_core_desktop_handshake(int fd, const char* preferred_encoding) {
     }
     write_u32_be(encs_msg + 4 + (num_encs++) * 4, 0); // Raw fallback
     write_u32_be(encs_msg + 4 + (num_encs++) * 4, (uint32_t)VNC_ENCODING_EXT_DESKTOP_SIZE);
+    if (audio_requested) {
+        write_u32_be(encs_msg + 4 + (num_encs++) * 4, (uint32_t)VNC_ENCODING_AUDIO);
+    }
     write_u16_be(encs_msg + 2, num_encs);
 
     send(fd, encs_msg, 4 + (size_t)num_encs * 4, 0);
@@ -903,6 +982,13 @@ int vnc_core_process_message(int fd) {
                     core_callbacks.on_desktop_resize(rw, rh, core_user_data);
                 }
             }
+            else if (encoding == (uint32_t)VNC_ENCODING_AUDIO) {
+                // QEMU audio feature ack: a bare pseudo-rect, no body.
+                vnc_audio_available = 1;
+                if (core_callbacks.on_audio_supported) {
+                    core_callbacks.on_audio_supported(core_user_data);
+                }
+            }
             else {
                 if (core_callbacks.on_custom_encoding) {
                     if (core_callbacks.on_custom_encoding(fd, encoding, rx, ry, rw, rh, core_user_data) < 0) {
@@ -929,6 +1015,34 @@ int vnc_core_process_message(int fd) {
         text[length] = '\0';
         core_callbacks.on_clipboard_update(text, (int)length, core_user_data);
         free(text);
+    }
+    else if (msg_type == 255) { // VNC_MSG_SERVER_QEMU
+        uint8_t qemu_sub = 0;
+        if (read_exact(fd, &qemu_sub, 1) < 0) return -1;
+        if (qemu_sub == 1) { // VNC_MSG_SERVER_QEMU_AUDIO
+            uint16_t audio_op = 0;
+            if (read_exact(fd, &audio_op, 2) < 0) return -1;
+            audio_op = read_u16_be((uint8_t*)&audio_op);
+            if (audio_op == 0) { // END
+                if (core_callbacks.on_audio_end) core_callbacks.on_audio_end(core_user_data);
+            } else if (audio_op == 1) { // BEGIN
+                if (core_callbacks.on_audio_begin) core_callbacks.on_audio_begin(core_user_data);
+            } else if (audio_op == 2) { // DATA
+                uint32_t len = 0;
+                if (read_exact(fd, &len, 4) < 0) return -1;
+                len = read_u32_be((uint8_t*)&len);
+                uint8_t* buf = len > 0 ? malloc(len) : NULL;
+                if (len > 0 && !buf) return -1;
+                if (len > 0 && read_exact(fd, buf, len) < 0) {
+                    free(buf);
+                    return -1;
+                }
+                if (core_callbacks.on_audio_data) {
+                    core_callbacks.on_audio_data(buf, len, core_user_data);
+                }
+                free(buf);
+            }
+        }
     }
     return 0;
 }

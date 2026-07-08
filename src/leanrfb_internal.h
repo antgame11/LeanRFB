@@ -97,6 +97,34 @@ typedef struct {
 #define VNC_EDS_STATUS_OUT_OF_RESOURCES 2
 #define VNC_EDS_STATUS_INVALID_LAYOUT 3
 
+// --- QEMU-compatible audio extension (see docs/custom/rfb_qemu_audio_extension.md
+// and src/leanrfb_audio.c). Wire constants match QEMU's ui/vnc.h exactly. ---
+#define VNC_ENCODING_AUDIO ((int32_t)0xFFFFFEFD) // -259
+
+#define VNC_MSG_CLIENT_QEMU 255
+#define VNC_MSG_SERVER_QEMU 255
+#define VNC_MSG_CLIENT_QEMU_EXT_KEY_EVENT 0
+#define VNC_MSG_CLIENT_QEMU_AUDIO 1
+#define VNC_MSG_SERVER_QEMU_AUDIO 1
+
+#define VNC_MSG_CLIENT_QEMU_AUDIO_ENABLE     0
+#define VNC_MSG_CLIENT_QEMU_AUDIO_DISABLE    1
+#define VNC_MSG_CLIENT_QEMU_AUDIO_SET_FORMAT 2
+
+#define VNC_MSG_SERVER_QEMU_AUDIO_END   0
+#define VNC_MSG_SERVER_QEMU_AUDIO_BEGIN 1
+#define VNC_MSG_SERVER_QEMU_AUDIO_DATA  2
+
+// Wire values for the SET_FORMAT message's sample-format byte.
+#define VNC_AUDIO_FMT_U8  0
+#define VNC_AUDIO_FMT_S8  1
+#define VNC_AUDIO_FMT_U16 2
+#define VNC_AUDIO_FMT_S16 3
+#define VNC_AUDIO_FMT_U32 4
+#define VNC_AUDIO_FMT_S32 5
+
+typedef struct vnc_audio_capture vnc_audio_capture_t;
+
 // Sliding replay window (64 packets) for anti-replay protection of one direction.
 typedef struct {
   uint64_t highest;
@@ -180,6 +208,21 @@ struct vnc_client {
   int ext_desktop_reason;         // VNC_EDS_REASON_* for the queued rect
   int ext_desktop_status;         // VNC_EDS_STATUS_* for the queued rect
 
+  // QEMU audio extension (see src/leanrfb_audio.c). All pending_* flags are
+  // drained by vnc_send_audio_update() — writes to a VNC_STATE_NORMAL client must
+  // go through that lazy queue rather than an immediate client_write_raw(), since
+  // vnc_client_flush() only emits a fresh WebSocket frame header when write_pos
+  // is 0 and an immediate write could land mid-frame.
+  int supports_audio;           // client advertised VNC_ENCODING_AUDIO and server->enable_audio is set
+  int pending_audio_ack;        // the bare VNC_ENCODING_AUDIO ack rect is queued to send
+  int pending_audio_begin;      // a BEGIN message is queued to send
+  int pending_audio_end;        // an END message is queued to send
+  int audio_enabled;            // client sent ENABLE (capture thread should be running)
+  uint8_t audio_wire_fmt;       // VNC_AUDIO_FMT_* from the client's last SET_FORMAT
+  int audio_channels;
+  int audio_freq;
+  vnc_audio_capture_t *audio_capture;
+
   vnc_client_t *next;
 };
 
@@ -235,6 +278,8 @@ struct vnc_server {
   int disable_udp_h264; // mirrors config->disable_udp_h264
 
   int allow_desktop_resize; // mirrors config->allow_desktop_resize
+
+  int enable_audio; // mirrors config->enable_audio (see src/leanrfb_audio.c)
 };
 
 // Byte-order conversion helper functions
@@ -363,5 +408,19 @@ int vnc_udp_send_video_frame(vnc_server_t* server, vnc_client_t* client,
 // Drain and process all pending datagrams on server->udp_fd (Hello/heartbeat handling).
 // Bounded so a single call cannot monopolize the poll loop under flood conditions.
 void vnc_udp_handle_incoming(vnc_server_t* server);
+
+// --- QEMU audio extension interface (src/leanrfb_audio.c) ---
+
+// Starts a background thread capturing the host's default audio output (the
+// PulseAudio/PipeWire-pulse monitor source) in the given wire format. Returns
+// NULL on failure (e.g. no PulseAudio/PipeWire server reachable).
+vnc_audio_capture_t* vnc_audio_capture_start(uint8_t wire_fmt, int channels, int freq);
+
+// Stops the capture thread and frees all associated resources. Safe to call with NULL.
+void vnc_audio_capture_stop(vnc_audio_capture_t* cap);
+
+// Drains up to max_len buffered bytes into out. Returns the number of bytes
+// actually copied (0 if nothing is pending yet).
+size_t vnc_audio_capture_drain(vnc_audio_capture_t* cap, uint8_t* out, size_t max_len);
 
 #endif // LEANRFB_INTERNAL_H

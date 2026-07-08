@@ -1,9 +1,9 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -O3 -g -std=c99 -Iinclude
-LDFLAGS = -L. -lleanrfb -ljpeg -lcrypto -lx264 -lvpx -lavcodec -lavutil
+CFLAGS = -Wall -Wextra -Werror -O3 -g -std=c99 -Iinclude -D_REENTRANT
+LDFLAGS = -L. -lleanrfb -ljpeg -lcrypto -lx264 -lvpx -lavcodec -lavutil -lpulse-simple -lpulse -lpthread
 X11_LDFLAGS = -lX11 -lXext -lXtst -lXfixes -lXrandr
 CLIENT_CFLAGS = $(shell pkg-config --cflags gtk+-3.0)
-CLIENT_LDFLAGS = $(shell pkg-config --libs gtk+-3.0) -lavcodec -lswscale -lavutil -ljpeg -lcrypto -lpthread
+CLIENT_LDFLAGS = $(shell pkg-config --libs gtk+-3.0) -lavcodec -lswscale -lavutil -ljpeg -lcrypto -lpulse-simple -lpulse -lpthread
 
 # Non-essential vncviewer diagnostic logging (connection lifecycle, encoding negotiation,
 # UDP transport handshake/reassembly, decoder state) is compiled out by default. Build
@@ -13,7 +13,7 @@ ifdef DEBUG
 CLIENT_CFLAGS += -DVNC_DEBUG
 endif
 
-LIB_OBJS = src/leanrfb.o src/leanrfb_hextile.o src/leanrfb_jpeg.o src/leanrfb_h264.o src/leanrfb_vp9.o src/leanrfb_udp.o
+LIB_OBJS = src/leanrfb.o src/leanrfb_hextile.o src/leanrfb_jpeg.o src/leanrfb_h264.o src/leanrfb_vp9.o src/leanrfb_udp.o src/leanrfb_audio.o
 LIB_NAME = libleanrfb.a
 
 all: $(LIB_NAME) demo_server x11_vnc_server vncviewer

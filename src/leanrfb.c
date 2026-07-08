@@ -23,6 +23,7 @@ static int client_write_raw(vnc_client_t* client, const void* data, size_t len);
 static void vnc_client_disconnect(vnc_server_t* server, vnc_client_t* client);
 static void client_read_handler(vnc_server_t* server, vnc_client_t* client);
 static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client);
+static void vnc_send_audio_update(vnc_server_t* server, vnc_client_t* client);
 
 // --- WebSocket and HTTP helpers ---
 
@@ -453,6 +454,7 @@ vnc_server_t* vnc_server_create(const vnc_server_config_t* config) {
     server->pfds_cap = 0;
     server->websocket = config->websocket;
     server->allow_desktop_resize = config->allow_desktop_resize;
+    server->enable_audio = config->enable_audio;
 
     if (!server->framebuffer || !server->server_dirty || !server->name) {
         vnc_server_destroy(server);
@@ -608,6 +610,11 @@ int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
                     new_client->supports_hextile = 0;
                     new_client->supports_rich_cursor = 0;
                     new_client->send_cursor_update = 1;
+                    // Matches QEMU's own VNC audio defaults, in case a client sends
+                    // ENABLE before ever sending SET_FORMAT.
+                    new_client->audio_wire_fmt = VNC_AUDIO_FMT_S16;
+                    new_client->audio_channels = 2;
+                    new_client->audio_freq = 44100;
 
                     new_client->write_cap = VNC_WRITE_BUF_INIT_SIZE;
                     new_client->write_buf = malloc(new_client->write_cap);
@@ -668,6 +675,11 @@ int vnc_server_poll(vnc_server_t* server, int timeout_ms) {
     while (client) {
         if (client->state == VNC_STATE_NORMAL && client->update_requested) {
             vnc_client_send_update(server, client);
+        }
+        // Independent of the video FramebufferUpdateRequest cycle above — audio
+        // should keep flowing even if the client is momentarily caught up on video.
+        if (client->state == VNC_STATE_NORMAL) {
+            vnc_send_audio_update(server, client);
         }
         client = client->next;
     }
@@ -937,6 +949,9 @@ static void vnc_client_disconnect(vnc_server_t* server, vnc_client_t* client) {
     }
     if (client->vp9_enc) {
         vnc_vp9_encoder_destroy(client->vp9_enc);
+    }
+    if (client->audio_capture) {
+        vnc_audio_capture_stop(client->audio_capture);
     }
     free(client->dirty_tiles);
     memset(client->udp_key, 0, sizeof(client->udp_key)); // don't leave session key material in freed heap memory
@@ -1243,6 +1258,8 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                 client->supports_udp = 0;
                 int had_ext_desktop_size = client->supports_ext_desktop_size;
                 client->supports_ext_desktop_size = 0;
+                int had_audio = client->supports_audio;
+                client->supports_audio = 0;
                 printf("[VNC SERVER] Client supports encodings: ");
                 for (int i = 0; i < num_encodings; i++) {
                     int32_t enc = (int32_t)read_u32_be(p + 4 + i * 4);
@@ -1261,6 +1278,10 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                         client->supports_ext_desktop_size = 1;
                     } else if (enc == -239) {
                         client->supports_rich_cursor = 1;
+                    } else if (enc == VNC_ENCODING_AUDIO) {
+                        if (server->enable_audio) {
+                            client->supports_audio = 1;
+                        }
                     }
                 }
                 // Per the RFB ExtendedDesktopSize extension: announce the current size
@@ -1270,6 +1291,11 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                     client->pending_ext_desktop_size = 1;
                     client->ext_desktop_reason = VNC_EDS_REASON_GENERIC;
                     client->ext_desktop_status = VNC_EDS_STATUS_SUCCESS;
+                }
+                // See src/leanrfb_audio.c: ack lets the client know it may now send
+                // ENABLE/DISABLE/SET_FORMAT.
+                if (client->supports_audio && !had_audio) {
+                    client->pending_audio_ack = 1;
                 }
                 printf("\n");
                 fflush(stdout);
@@ -1377,6 +1403,71 @@ static void client_read_handler(vnc_server_t* server, vnc_client_t* client) {
                 // from (e.g. mid-GOP fragment loss); asks the encoder for a fresh IDR.
                 client->force_keyframe_requested = 1;
                 processed += 1;
+            }
+            else if (msg_type == VNC_MSG_CLIENT_QEMU) { // 255: QEMU extension wrapper
+                if (remaining < 2) break;
+                uint8_t qemu_sub = p[1];
+
+                if (qemu_sub == VNC_MSG_CLIENT_QEMU_EXT_KEY_EVENT) {
+                    // Not implemented server-side, but the fixed-size payload
+                    // (down:u16 + keysym:u32 + keycode:u32) must still be consumed
+                    // to keep the stream in sync.
+                    if (remaining < 12) break;
+                    processed += 12;
+                }
+                else if (qemu_sub == VNC_MSG_CLIENT_QEMU_AUDIO) {
+                    if (!client->supports_audio) goto disconnect;
+                    if (remaining < 4) break;
+                    uint16_t audio_op = read_u16_be(p + 2);
+
+                    if (audio_op == VNC_MSG_CLIENT_QEMU_AUDIO_ENABLE) {
+                        processed += 4;
+                        if (!client->audio_enabled) {
+                            client->audio_capture = vnc_audio_capture_start(
+                                client->audio_wire_fmt, client->audio_channels, client->audio_freq);
+                            if (client->audio_capture) {
+                                client->audio_enabled = 1;
+                                client->pending_audio_begin = 1;
+                            }
+                        }
+                    }
+                    else if (audio_op == VNC_MSG_CLIENT_QEMU_AUDIO_DISABLE) {
+                        processed += 4;
+                        if (client->audio_enabled) {
+                            vnc_audio_capture_stop(client->audio_capture);
+                            client->audio_capture = NULL;
+                            client->audio_enabled = 0;
+                            client->pending_audio_end = 1;
+                        }
+                    }
+                    else if (audio_op == VNC_MSG_CLIENT_QEMU_AUDIO_SET_FORMAT) {
+                        if (remaining < 10) break;
+                        uint8_t wire_fmt = p[4];
+                        uint8_t channels = p[5];
+                        uint32_t freq = read_u32_be(p + 6);
+                        processed += 10;
+
+                        if (wire_fmt <= VNC_AUDIO_FMT_S32 && (channels == 1 || channels == 2) &&
+                            freq > 0 && freq <= 48000) {
+                            client->audio_wire_fmt = wire_fmt;
+                            client->audio_channels = channels;
+                            client->audio_freq = (int)freq;
+                            // Restart an already-running capture so the new format
+                            // actually takes effect.
+                            if (client->audio_enabled) {
+                                vnc_audio_capture_stop(client->audio_capture);
+                                client->audio_capture = vnc_audio_capture_start(wire_fmt, channels, (int)freq);
+                                client->audio_enabled = client->audio_capture != NULL;
+                            }
+                        }
+                    }
+                    else {
+                        goto disconnect;
+                    }
+                }
+                else {
+                    goto disconnect;
+                }
             }
             else {
                 goto disconnect;
@@ -1858,6 +1949,76 @@ static void vnc_client_send_update(vnc_server_t* server, vnc_client_t* client) {
 
     // Flush the entire frame update in one go (minimizes send() syscalls)
     vnc_client_flush(client);
+}
+
+// QEMU audio extension output (see src/leanrfb_audio.c). Sends the feature-ack
+// pseudo-rect and BEGIN/END/DATA messages queued by client_read_handler and the
+// capture thread. All writes here go through client_buf_append + one flush per
+// call, same as vnc_client_send_update, to avoid emitting a WebSocket frame
+// header mid-message (see the vnc_client struct's audio field comments).
+static void vnc_send_audio_update(vnc_server_t* server, vnc_client_t* client) {
+    if (client->write_len > client->write_pos) return; // previous write still draining
+
+    int wrote_anything = 0;
+
+    if (client->pending_audio_ack) {
+        uint8_t header[4] = {0, 0, 0, 1};
+        uint8_t r_header[12];
+        write_u16_be(r_header + 0, 0);
+        write_u16_be(r_header + 2, 0);
+        write_u16_be(r_header + 4, server->width);
+        write_u16_be(r_header + 6, server->height);
+        write_u32_be(r_header + 8, (uint32_t)VNC_ENCODING_AUDIO);
+
+        if (client_buf_append(client, header, 4) == 0 &&
+            client_buf_append(client, r_header, 12) == 0) {
+            client->pending_audio_ack = 0;
+            wrote_anything = 1;
+        }
+    }
+
+    if (client->pending_audio_begin) {
+        uint8_t msg[4];
+        msg[0] = VNC_MSG_SERVER_QEMU;
+        msg[1] = VNC_MSG_SERVER_QEMU_AUDIO;
+        write_u16_be(msg + 2, VNC_MSG_SERVER_QEMU_AUDIO_BEGIN);
+        if (client_buf_append(client, msg, 4) == 0) {
+            client->pending_audio_begin = 0;
+            wrote_anything = 1;
+        }
+    }
+
+    if (client->pending_audio_end) {
+        uint8_t msg[4];
+        msg[0] = VNC_MSG_SERVER_QEMU;
+        msg[1] = VNC_MSG_SERVER_QEMU_AUDIO;
+        write_u16_be(msg + 2, VNC_MSG_SERVER_QEMU_AUDIO_END);
+        if (client_buf_append(client, msg, 4) == 0) {
+            client->pending_audio_end = 0;
+            wrote_anything = 1;
+        }
+    }
+
+    if (client->audio_enabled && client->audio_capture) {
+        uint8_t chunk[4096];
+        size_t got = vnc_audio_capture_drain(client->audio_capture, chunk, sizeof(chunk));
+        if (got > 0) {
+            uint8_t header[8];
+            header[0] = VNC_MSG_SERVER_QEMU;
+            header[1] = VNC_MSG_SERVER_QEMU_AUDIO;
+            write_u16_be(header + 2, VNC_MSG_SERVER_QEMU_AUDIO_DATA);
+            write_u32_be(header + 4, (uint32_t)got);
+
+            if (client_buf_append(client, header, 8) == 0 &&
+                client_buf_append(client, chunk, got) == 0) {
+                wrote_anything = 1;
+            }
+        }
+    }
+
+    if (wrote_anything) {
+        vnc_client_flush(client);
+    }
 }
 
 void vnc_server_set_cursor(vnc_server_t* server, const uint32_t* pixels, uint16_t w, uint16_t h, uint16_t xhot, uint16_t yhot) {

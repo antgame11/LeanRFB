@@ -59,6 +59,12 @@ typedef struct vnc_server_config {
                                // rejected (VNC_RESIZE_PROHIBITED) when this is 0 or when
                                // on_resize_request is NULL. See
                                // docs/custom/rfb_desktop_resize_extension.md for details.
+    int enable_audio;          // 1 to let clients opt into streaming the host's desktop
+                               // audio output (QEMU-compatible VNC audio extension —
+                               // see docs/custom/rfb_qemu_audio_extension.md). Captured via
+                               // the default PulseAudio/PipeWire sink's monitor source, so
+                               // a working PulseAudio (or pipewire-pulse) session is
+                               // required on the host for this to actually produce sound.
 
     vnc_key_event_cb on_key;   // Key event callback
     vnc_pointer_event_cb on_pointer; // Pointer event callback
