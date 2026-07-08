@@ -24,6 +24,7 @@ typedef struct {
     int pts;
     int is_hw; // 1 = VA-API, 0 = Software libvpx-vp9
     int force_keyframe; // set by vnc_vp9_encoder_force_keyframe(), consumed on next encode
+    enum AVPixelFormat sw_format;
 } vnc_vp9_encoder_t;
 
 // Color space conversion helper functions (fast integer logic) — duplicated from
@@ -132,12 +133,31 @@ void* vnc_vp9_encoder_create(int width, int height, int fps, int quality) {
             if (hw_frames_ref) {
                 AVHWFramesContext* frames_ctx = (AVHWFramesContext*)hw_frames_ref->data;
                 frames_ctx->format = AV_PIX_FMT_VAAPI;
-                frames_ctx->sw_format = AV_PIX_FMT_NV12;
+                frames_ctx->sw_format = AV_PIX_FMT_BGRA; // Try BGRA first
                 frames_ctx->width = width;
                 frames_ctx->height = height;
                 frames_ctx->initial_pool_size = 4;
                 if (av_hwframe_ctx_init(hw_frames_ref) >= 0) {
                     enc->codec_ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
+                } else {
+                    // Fallback to NV12 if BGRA fails
+                    av_buffer_unref(&hw_frames_ref);
+                    hw_frames_ref = av_hwframe_ctx_alloc(enc->hw_device_ctx);
+                    if (hw_frames_ref) {
+                        frames_ctx = (AVHWFramesContext*)hw_frames_ref->data;
+                        frames_ctx->format = AV_PIX_FMT_VAAPI;
+                        frames_ctx->sw_format = AV_PIX_FMT_NV12;
+                        frames_ctx->width = width;
+                        frames_ctx->height = height;
+                        frames_ctx->initial_pool_size = 4;
+                        if (av_hwframe_ctx_init(hw_frames_ref) >= 0) {
+                            enc->codec_ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
+                        }
+                    }
+                }
+                if (enc->codec_ctx->hw_frames_ctx) {
+                    AVHWFramesContext* final_ctx = (AVHWFramesContext*)enc->codec_ctx->hw_frames_ctx->data;
+                    enc->sw_format = final_ctx->sw_format;
                 }
                 av_buffer_unref(&hw_frames_ref);
             }
@@ -197,6 +217,7 @@ void* vnc_vp9_encoder_create(int width, int height, int fps, int quality) {
         int open_ret = avcodec_open2(enc->codec_ctx, codec, NULL);
         if (open_ret >= 0) {
             enc->is_hw = 0; // Software libvpx-vp9
+            enc->sw_format = enc->codec_ctx->pix_fmt;
             printf("[VNC SERVER] GPU Hardware Encoding not supported. Falling back to CPU software encoding (VP9).\n");
             goto init_frames;
         }
@@ -220,7 +241,7 @@ init_frames:
     enc->sw_frame = av_frame_alloc();
     enc->sw_frame->width = width;
     enc->sw_frame->height = height;
-    enc->sw_frame->format = (enc->is_hw > 0) ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+    enc->sw_frame->format = enc->sw_format;
     av_frame_get_buffer(enc->sw_frame, 0);
     return enc;
 }
@@ -232,7 +253,15 @@ int vnc_vp9_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_data
     av_frame_make_writable(enc->sw_frame);
 
     if (enc->is_hw > 0) {
-        bgra_to_nv12(fb, enc->width, enc->height, enc->sw_frame);
+        if (enc->sw_format == AV_PIX_FMT_BGRA || enc->sw_format == AV_PIX_FMT_RGBA) {
+            int linesize = enc->sw_frame->linesize[0];
+            uint8_t* dst = enc->sw_frame->data[0];
+            for (int row = 0; row < enc->height; row++) {
+                memcpy(dst + row * linesize, fb + row * enc->width, (size_t)enc->width * 4);
+            }
+        } else {
+            bgra_to_nv12(fb, enc->width, enc->height, enc->sw_frame);
+        }
     } else {
         bgra_to_yuv420p(fb, enc->width, enc->height, enc->sw_frame);
     }
