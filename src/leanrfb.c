@@ -1583,7 +1583,25 @@ static void vnc_send_video_update(vnc_server_t* server, vnc_client_t* client,
     int video_len = 0;
     int is_key = 0;
     int pts = 0;
-    if (ops->encode(*enc_slot, server->framebuffer, &video_data, &video_len, &is_key, &pts) == 0 && video_len > 0) {
+    int enc_ret = ops->encode(*enc_slot, server->framebuffer, &video_data, &video_len, &is_key, &pts);
+    if (enc_ret == 0 && video_len == 0) {
+        // Not an error — low-delay hardware encoders can take a couple of frames
+        // before their first packet comes out. But if this persists well beyond
+        // that, the encoder is stuck (bad driver/format/config) rather than just
+        // warming up, and previously this failed completely silently — no crash,
+        // no frames, no indication why. Surface it once so it's diagnosable.
+        client->video_stall_frames++;
+        if (client->video_stall_frames == 60) {
+            fprintf(stderr,
+                "[VNC SERVER] Warning: video encoder has produced no output for %d consecutive frames "
+                "(encode() keeps returning success with 0 bytes) — likely a stuck/misconfigured hardware "
+                "encoder. Try disabling UDP/hardware encoding or check driver logs.\n",
+                client->video_stall_frames);
+        }
+    } else if (enc_ret == 0) {
+        client->video_stall_frames = 0;
+    }
+    if (enc_ret == 0 && video_len > 0) {
         // Any keyframe the encoder actually emits is by definition self-contained (no
         // dependency on prior frames) and safe to reset the client's decoder onto. This
         // used to instead check `pts == 1` as a proxy for "the first real output packet,

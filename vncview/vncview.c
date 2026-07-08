@@ -526,13 +526,17 @@ static gboolean queue_draw_idle(gpointer data) {
 static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
     if (pt_len < VNC_UDP_INNER_HDR_LEN) return;
 
+    // Wire layout (see VNC_UDP_INNER_HDR_LEN in leanrfb_internal.h, and the server's
+    // matching write order in src/leanrfb_udp.c): frame_id(4) frag_idx(2) frag_count(2)
+    // flags(1) reserved(1). There is no explicit fragment-length field on the wire —
+    // the payload length is implicit in how many plaintext bytes followed the header.
     uint32_t frame_id = ((uint32_t)pt[0] << 24) | ((uint32_t)pt[1] << 16) | ((uint32_t)pt[2] << 8) | pt[3];
-    uint16_t frag_count = ((uint16_t)pt[4] << 8) | pt[5];
-    uint16_t frag_idx = ((uint16_t)pt[6] << 8) | pt[7];
-    uint16_t frag_len = ((uint16_t)pt[8] << 8) | pt[9];
-    uint8_t flags = pt[4] & 0x03; 
+    uint16_t frag_idx = ((uint16_t)pt[4] << 8) | pt[5];
+    uint16_t frag_count = ((uint16_t)pt[6] << 8) | pt[7];
+    uint8_t flags = pt[8] & 0x03;
+    uint16_t frag_len = (uint16_t)(pt_len - VNC_UDP_INNER_HDR_LEN);
 
-    if (frag_idx >= frag_count || frag_len > VNC_UDP_MAX_FRAG_PAYLOAD || pt_len < VNC_UDP_INNER_HDR_LEN + frag_len) return;
+    if (frag_idx >= frag_count || frag_len > VNC_UDP_MAX_FRAG_PAYLOAD) return;
 
     if (!reasm_active || frame_id > reasm_frame_id) {
         if (have_last_completed_frame && frame_id <= last_completed_frame_id) return;
@@ -582,6 +586,17 @@ static void reasm_add_fragment(const uint8_t* pt, int pt_len) {
         waiting_for_draw = 1;
         pthread_mutex_unlock(&backbuffer_mutex);
         g_idle_add((GSourceFunc)queue_draw_idle, NULL);
+
+        // The server only encodes/sends another video frame once it sees a fresh
+        // FramebufferUpdateRequest (client->update_requested), same as for any other
+        // encoding — but UDP-delivered frames never go through vnc_core_process_message's
+        // TCP FramebufferUpdate handling, which is the only place that request normally
+        // gets sent. Without this, the server sends exactly one frame over UDP and then
+        // stops forever (has nothing left asking it to continue), leaving the client
+        // stuck on a single stale/black frame. Re-request here so UDP video keeps flowing.
+        if (vnc_fd >= 0) {
+            vnc_core_send_fb_request(1, 0, 0, screen_w, screen_h);
+        }
     }
 }
 

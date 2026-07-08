@@ -155,6 +155,7 @@ struct vnc_client {
   int supports_vp9;
   void *vp9_enc;
   int force_keyframe_requested; // set when client asks the encoder to emit a fresh IDR/keyframe
+  int video_stall_frames; // consecutive encode() calls that produced no packet (diagnostic)
 
   // UDP H.264 transport (see docs/custom/rfb_h264_udp_extension.md)
   int supports_udp;          // client advertised VNC_ENCODING_UDP_SETUP

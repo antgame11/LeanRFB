@@ -215,9 +215,19 @@ int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_dat
     if (enc->is_hw == 1) { // VA-API hardware context texture upload
         av_frame_unref(enc->hw_frame);
         int err = av_hwframe_get_buffer(enc->codec_ctx->hw_frames_ctx, enc->hw_frame, 0);
-        if (err < 0) return -1;
+        if (err < 0) {
+            char errbuf[128];
+            av_strerror(err, errbuf, sizeof(errbuf));
+            fprintf(stderr, "[VNC SERVER] H.264: av_hwframe_get_buffer failed: %s\n", errbuf);
+            return -1;
+        }
         err = av_hwframe_transfer_data(enc->hw_frame, enc->sw_frame, 0);
-        if (err < 0) return -1;
+        if (err < 0) {
+            char errbuf[128];
+            av_strerror(err, errbuf, sizeof(errbuf));
+            fprintf(stderr, "[VNC SERVER] H.264: av_hwframe_transfer_data failed: %s\n", errbuf);
+            return -1;
+        }
         send_frame = enc->hw_frame;
     }
 
@@ -231,7 +241,12 @@ int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_dat
     }
 
     int ret = avcodec_send_frame(enc->codec_ctx, send_frame);
-    if (ret < 0) return -1;
+    if (ret < 0) {
+        char errbuf[128];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        fprintf(stderr, "[VNC SERVER] H.264: avcodec_send_frame failed: %s\n", errbuf);
+        return -1;
+    }
 
     av_packet_unref(enc->pkt);
     ret = avcodec_receive_packet(enc->codec_ctx, enc->pkt);
@@ -241,6 +256,9 @@ int vnc_h264_encoder_encode(void* enc_ptr, const uint32_t* fb, uint8_t** out_dat
         *is_keyframe = 0;
         return 0;
     } else if (ret < 0) {
+        char errbuf[128];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        fprintf(stderr, "[VNC SERVER] H.264: avcodec_receive_packet failed: %s\n", errbuf);
         return -1;
     }
 
