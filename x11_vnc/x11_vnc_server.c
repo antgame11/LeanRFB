@@ -111,6 +111,17 @@ static void copy_ximage_to_fb(XImage* img, uint32_t* fb) {
                 const uint32_t* src = (const uint32_t*)(img->data + y * img->bytes_per_line);
                 memcpy(&fb[y * width], src, (size_t)width * 4);
             }
+        }
+        // Fast path for standard RGBA format (R=0x000000FF, G=0x0000FF00, B=0x00FF0000)
+        else if (r_mask == 0x000000FF && g_mask == 0x0000FF00 && b_mask == 0x00FF0000) {
+            for (int y = 0; y < height; y++) {
+                const uint32_t* src = (const uint32_t*)(img->data + y * img->bytes_per_line);
+                uint32_t* dst = &fb[y * width];
+                for (int x = 0; x < width; x++) {
+                    uint32_t pixel = src[x];
+                    dst[x] = ((pixel & 0xFF) << 16) | (pixel & 0xFF00) | ((pixel & 0xFF0000) >> 16);
+                }
+            }
         } else {
             // Calculate shifts
             int r_shift = 0, g_shift = 0, b_shift = 0;
@@ -559,7 +570,7 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, handle_exit_signal);
     signal(SIGTERM, handle_exit_signal);
 
-    unsigned long long last_frame_time = get_time_ms();
+    unsigned long long next_frame_time = get_time_ms();
 
     while (!g_should_exit) {
         // Process X11 clipboard/selection events
@@ -633,10 +644,9 @@ int main(int argc, char* argv[]) {
         }
 
         unsigned long long now = get_time_ms();
-        unsigned long long elapsed = now - last_frame_time;
 
         // Target 60 FPS (16 ms frame time)
-        if (elapsed >= 16) {
+        if (now >= next_frame_time) {
             // Skip capture entirely when no clients are connected — saves the full
             // XShm read + pixel conversion + tile comparison cost at idle.
             if (vnc_server_has_clients(server)) {
@@ -676,15 +686,20 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            last_frame_time = now;
-            elapsed = 0;
+            next_frame_time += 16;
+            if (now > next_frame_time + 16) {
+                next_frame_time = now;
+            }
         }
 
         // Poll VNC events with remaining time in the 16ms window
-        unsigned long long sleep_time = 16 - elapsed;
-        if (sleep_time > 16) sleep_time = 0;
+        now = get_time_ms();
+        int sleep_time = 0;
+        if (next_frame_time > now) {
+            sleep_time = (int)(next_frame_time - now);
+        }
 
-        vnc_server_poll(server, (int)sleep_time);
+        vnc_server_poll(server, sleep_time);
     }
 
     // Cleanup (reached on SIGINT/SIGTERM)
