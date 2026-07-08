@@ -2000,7 +2000,12 @@ static void vnc_send_audio_update(vnc_server_t* server, vnc_client_t* client) {
     }
 
     if (client->audio_enabled && client->audio_capture) {
-        uint8_t chunk[4096];
+        // Sized to drain the entire capture ring (see VNC_AUDIO_RING_CAP in
+        // leanrfb_audio.c) in one call, rather than trickling it out a fixed
+        // 4KB at a time regardless of how much is actually backlogged — that
+        // throttling was the main source of growing audio delay under any
+        // poll-loop hiccup (screen capture/encode taking a beat, etc).
+        uint8_t chunk[128 * 1024];
         size_t got = vnc_audio_capture_drain(client->audio_capture, chunk, sizeof(chunk));
         if (got > 0) {
             uint8_t header[8];

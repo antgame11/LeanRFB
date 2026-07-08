@@ -20,7 +20,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VNC_AUDIO_RING_CAP (256 * 1024)
+// Bounds worst-case buffered (i.e. stale-by-the-time-you-hear-it) audio to
+// well under a second at the highest rate/format this project's clients
+// negotiate (44100Hz stereo S16 = 176400 B/s) — big enough to absorb the main
+// poll loop occasionally taking a while (a slow screen capture or video encode
+// pass elsewhere in the same loop), small enough that a lagging drain doesn't
+// turn into a persistent, growing playback delay the way the original 256KB
+// (~1.5s) buffer combined with a fixed small per-call drain size did.
+#define VNC_AUDIO_RING_CAP (128 * 1024)
 #define VNC_AUDIO_CAPTURE_CHUNK 4096
 
 struct vnc_audio_capture {
@@ -71,15 +78,25 @@ static void* vnc_audio_capture_thread_main(void* arg) {
         }
 
         pthread_mutex_lock(&cap->mutex);
+        // If the poll loop falls behind, evict the *oldest* buffered bytes to make
+        // room rather than dropping what we just captured. Otherwise the backlog
+        // is stuck being drained in FIFO order — the client keeps hearing older
+        // and older audio and the delay only ever grows. Evicting old bytes
+        // instead keeps the buffer representing (at most) the ring's fixed
+        // real-time window, so playback delay stays bounded instead of
+        // accumulating.
+        if (sizeof(chunk) > VNC_AUDIO_RING_CAP - cap->ring_len) {
+            size_t drop = sizeof(chunk) - (VNC_AUDIO_RING_CAP - cap->ring_len);
+            if (drop > cap->ring_len) drop = cap->ring_len;
+            memmove(cap->ring, cap->ring + drop, cap->ring_len - drop);
+            cap->ring_len -= drop;
+        }
         size_t space = VNC_AUDIO_RING_CAP - cap->ring_len;
         size_t take = sizeof(chunk) < space ? sizeof(chunk) : space;
         if (take > 0) {
             memcpy(cap->ring + cap->ring_len, chunk, take);
             cap->ring_len += take;
         }
-        // If the poll loop can't drain fast enough the buffer just fills up and
-        // we start dropping newly-captured samples (backpressure) rather than
-        // growing without bound or blocking the capture thread indefinitely.
         pthread_mutex_unlock(&cap->mutex);
     }
 
